@@ -1,0 +1,4 @@
+/internal/
+/target/
+/tools/*/target/
+**/__pycache__/

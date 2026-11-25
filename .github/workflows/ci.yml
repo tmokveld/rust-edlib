@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    env:
+      CC: "false"
+      CXX: "false"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.85.0 --profile minimal
+      - run: cargo +1.85.0 test --locked
+      - run: cargo +1.85.0 test --locked --release
+
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: Martinsos/edlib
+          ref: f8afceb49ab0095c852e0b8b488ae2c88e566afd # python-1.3.9
+          path: target/edlib-upstream
+          persist-credentials: false
+      - name: Compare with upstream Edlib
+        shell: bash
+        env:
+          EDLIB_SOURCE: ${{ github.workspace }}/target/edlib-upstream
+        run: |
+          rustc +stable --version
+          c++ --version
+          echo '### Release benchmark vs. upstream Edlib 1.3.9' >> "$GITHUB_STEP_SUMMARY"
+          cargo +stable run --locked --release --manifest-path tools/edlib-bench/Cargo.toml \
+            | tee -a "$GITHUB_STEP_SUMMARY"

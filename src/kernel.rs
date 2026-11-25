@@ -1,0 +1,821 @@
+use crate::aligner::{AlignError, EqualityPair};
+use std::{mem::size_of, ops::Range};
+
+pub(crate) fn check_buffer<T>(len: usize) -> Result<(), AlignError> {
+    len.checked_mul(size_of::<T>())
+        .filter(|&n| n <= isize::MAX as usize)
+        .map(|_| ())
+        .ok_or(AlignError::InputTooLong)
+}
+
+/// Reversed traversal without copying input bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct Sequence<'a> {
+    bytes: &'a [u8],
+    reverse: bool,
+}
+impl<'a> Sequence<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            reverse: false,
+        }
+    }
+    pub fn reversed(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            reverse: true,
+        }
+    }
+    pub fn len(self) -> usize {
+        self.bytes.len()
+    }
+    #[inline]
+    pub fn at(self, i: usize) -> u8 {
+        self.bytes[if self.reverse {
+            self.bytes.len() - 1 - i
+        } else {
+            i
+        }]
+    }
+}
+
+/// Only query symbols and equality partners need rows. Unknown target symbols
+/// share row zero. No target scan, transformed input, or 256 x m initialization.
+pub(crate) struct Profile {
+    pub len: usize,
+    pub blocks: usize,
+    // Row IDs need nine bits, irrespective of query length. A compact index
+    // avoids moving/clearing 2 KiB per call; resolve its word offset once per
+    // target column, outside the block loop.
+    indices: [u16; 256],
+    words: Vec<u64>,
+}
+
+impl Profile {
+    // Keep construction in the caller: out-of-line Result returns copied the
+    // profile index twice in short alignments (see results/profile-short).
+    #[inline(always)]
+    pub fn new(query: Sequence<'_>, pairs: &[EqualityPair]) -> Result<Self, AlignError> {
+        let blocks = query.len().div_ceil(64);
+        let mut indices = [0u16; 256];
+        let mut rows = 1;
+        let mut add = |byte: u8| {
+            if indices[byte as usize] == 0 {
+                indices[byte as usize] = rows as u16;
+                rows += 1;
+            }
+        };
+        // Precheck makes the per-symbol offset multiplication safe.
+        check_buffer::<u64>(blocks.checked_mul(257).ok_or(AlignError::InputTooLong)?)?;
+        for i in 0..query.len() {
+            add(query.at(i));
+        }
+        for pair in pairs {
+            add(pair.first);
+            add(pair.second);
+        }
+        let mut words = vec![0; rows * blocks];
+        // Row IDs below `rows` need `bits` bits. Tiny alphabets use bit planes
+        // in registers; others scatter. The scatter's read-modify-write chains
+        // serialize through memory whenever a symbol repeats closely.
+        let bits = usize::BITS - (rows - 1).leading_zeros();
+        match bits {
+            1 => Self::planes::<1>(&mut words, &indices, blocks, rows, query),
+            2 => Self::planes::<2>(&mut words, &indices, blocks, rows, query),
+            3 => Self::planes::<3>(&mut words, &indices, blocks, rows, query),
+            _ => {
+                for i in 0..query.len() {
+                    words[indices[query.at(i) as usize] as usize * blocks + i / 64] |=
+                        1u64 << (i % 64);
+                }
+            }
+        }
+        if !pairs.is_empty() {
+            Self::add_equalities(&mut words, &indices, blocks, query, pairs);
+        }
+        // Padding is a suffix of wildcard rows. It cannot influence any real
+        // query row; semi-global reporting uses the resulting diagonal delay.
+        let used = query.len() % 64;
+        if used != 0 {
+            let padding = u64::MAX << used;
+            for row in words.chunks_exact_mut(blocks) {
+                row[blocks - 1] |= padding;
+            }
+        }
+        Ok(Self {
+            len: query.len(),
+            blocks,
+            indices,
+            words,
+        })
+    }
+
+    /// Bit-sliced construction for row IDs of at most `P` bits. Plane `j`
+    /// collects bit `j` of every position's row ID in one 64-position block;
+    /// a row's word is the intersection of planes (or complements) matching
+    /// its ID. Every row ID is nonzero, so positions past the query end, whose
+    /// planes are zero, never enter a row. Exactly the scatter loop's words.
+    #[inline(always)]
+    fn planes<const P: usize>(
+        words: &mut [u64],
+        indices: &[u16; 256],
+        blocks: usize,
+        rows: usize,
+        query: Sequence<'_>,
+    ) {
+        for b in 0..blocks {
+            let start = b * 64;
+            let mut plane = [0u64; P];
+            for i in start..query.len().min(start + 64) {
+                let id = u64::from(indices[query.at(i) as usize]);
+                for (j, word) in plane.iter_mut().enumerate() {
+                    *word |= ((id >> j) & 1) << (i - start);
+                }
+            }
+            for row in 1..rows {
+                let mut mask = u64::MAX;
+                for (j, &word) in plane.iter().enumerate() {
+                    mask &= if (row >> j) & 1 != 0 { word } else { !word };
+                }
+                words[row * blocks + b] = mask;
+            }
+        }
+    }
+
+    // Kept out of the common path so ordinary equality needs no large table.
+    fn add_equalities(
+        words: &mut [u64],
+        indices: &[u16; 256],
+        blocks: usize,
+        query: Sequence<'_>,
+        pairs: &[EqualityPair],
+    ) {
+        let mut neighbors = [[0u64; 4]; 256];
+        for pair in pairs {
+            let (a, b) = (pair.first as usize, pair.second as usize);
+            neighbors[a][b / 64] |= 1 << (b % 64);
+            neighbors[b][a / 64] |= 1 << (a % 64);
+        }
+        // Read the original query, never an already-extended profile: OR-ing
+        // extended rows would accidentally make equalities transitive.
+        for i in 0..query.len() {
+            for (group, &bits) in neighbors[query.at(i) as usize].iter().enumerate() {
+                let mut bits = bits;
+                while bits != 0 {
+                    let symbol = group * 64 + bits.trailing_zeros() as usize;
+                    words[indices[symbol] as usize * blocks + i / 64] |= 1 << (i % 64);
+                    bits &= bits - 1;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn row(&self, symbol: u8) -> &[u64] {
+        let offset = self.indices[symbol as usize] as usize * self.blocks;
+        &self.words[offset..offset + self.blocks]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Block {
+    pub p: u64,
+    pub m: u64,
+    pub score: isize,
+}
+
+impl Block {
+    /// Vertical differences encode D[r,c]-D[r-1,c]. Bits above the requested
+    /// row must be subtracted from the bottom score; popcount avoids 64 steps.
+    #[inline]
+    pub fn value(self, row: usize) -> isize {
+        let mask = if row == 63 { 0 } else { u64::MAX << (row + 1) };
+        self.score - (self.p & mask).count_ones() as isize + (self.m & mask).count_ones() as isize
+    }
+    fn all_larger(self, k: isize) -> bool {
+        let mut value = self.score;
+        for i in (0..64).rev() {
+            if value <= k {
+                return false;
+            }
+            value -= ((self.p >> i) & 1) as isize;
+            value += ((self.m >> i) & 1) as isize;
+        }
+        true
+    }
+}
+
+/// Split +/- horizontal carries avoid decoding/re-encoding between words.
+#[derive(Clone, Copy)]
+struct Deltas {
+    p: u64,
+    m: u64,
+}
+
+impl Deltas {
+    #[inline]
+    fn value(self) -> isize {
+        self.p as isize - self.m as isize
+    }
+}
+
+/// Myers' horizontal deltas without materializing `Xh = (sum ^ pv) | eq`,
+/// where `sum = (eq & pv) + pv`. Exact bitwise identities give
+/// `Xh | pv = sum | eq | pv` and `pv & Xh = pv & (eq | !sum)`, removing the
+/// XOR and one OR from the loop-carried dependency chain. Returns `(Ph, Mh)`.
+#[inline(always)]
+fn horizontal(eq: u64, pv: u64, mv: u64) -> (u64, u64) {
+    // Overflow is the discarded carry beyond this word, not a Rust overflow.
+    let sum = (eq & pv).wrapping_add(pv);
+    (mv | !(sum | (eq | pv)), pv & (eq | !sum))
+}
+
+#[inline]
+fn advance(block: &mut Block, mut eq: u64, carry: &mut Deltas) {
+    let (pv, mv) = (block.p, block.m);
+    let xv = eq | mv;
+    eq |= carry.m;
+    let (ph, mh) = horizontal(eq, pv, mv);
+    let next = Deltas {
+        p: ph >> 63,
+        m: mh >> 63,
+    };
+    let ph = (ph << 1) | carry.p;
+    let mh = (mh << 1) | carry.m;
+    block.p = mh | !(xv | ph);
+    block.m = ph & xv;
+    *carry = next;
+}
+
+#[inline]
+fn advance_single<const FREE: bool>(
+    eq: u64,
+    high: u64,
+    pv: &mut u64,
+    mv: &mut u64,
+    score: &mut isize,
+) {
+    let xv = eq | *mv;
+    let (ph, mh) = horizontal(eq, *pv, *mv);
+    *score += isize::from(ph & high != 0) - isize::from(mh & high != 0);
+    let ph = (ph << 1) | u64::from(!FREE);
+    *pv = (mh << 1) | !(xv | ph);
+    *mv = ph & xv;
+}
+
+pub(crate) struct Column {
+    pub blocks: Vec<Block>,
+    pub first: usize,
+    pub last: usize,
+}
+
+impl Column {
+    pub fn value(&self, row: usize) -> Option<isize> {
+        let b = row.checked_sub(1)? / 64;
+        (self.first..=self.last)
+            .contains(&b)
+            .then(|| self.blocks[b].value((row - 1) % 64))
+    }
+}
+
+/// Compact saved active blocks. Only small subproblems create a Trace; larger
+/// ones retain two columns and recurse. Capacity is checked and reserved once.
+pub(crate) struct Trace {
+    pub blocks: Vec<Block>,
+    pub columns: Vec<(usize, Range<usize>)>,
+}
+
+impl Trace {
+    pub fn new(max_blocks: usize, columns: usize) -> Result<Self, AlignError> {
+        let count = max_blocks
+            .checked_mul(columns)
+            .ok_or(AlignError::InputTooLong)?;
+        check_buffer::<Block>(count)?;
+        check_buffer::<(usize, Range<usize>)>(columns)?;
+        Ok(Self {
+            blocks: Vec::with_capacity(count),
+            columns: Vec::with_capacity(columns),
+        })
+    }
+
+    /// Scores at a positive row and the row above it in one saved column.
+    /// Within a block, decode once and obtain the neighbor from its delta.
+    pub fn scores(&self, row: usize, col: usize) -> (Option<isize>, Option<isize>) {
+        if col == 0 {
+            return (Some(row as isize), Some(row as isize - 1));
+        }
+        let (first, range) = &self.columns[col - 1];
+        let block = |b: usize| {
+            (*first..*first + range.len())
+                .contains(&b)
+                .then(|| &self.blocks[range.start + b - first])
+        };
+        let b = (row - 1) / 64;
+        let bit = (row - 1) % 64;
+        let current = block(b);
+        let value = current.map(|block| block.value(bit));
+        let above = if row == 1 {
+            Some(col as isize)
+        } else if bit == 0 {
+            // The previous block can be absent even when the current one is
+            // retained, or present when the current one is absent.
+            block(b - 1).map(|block| block.score)
+        } else {
+            current.map(|block| {
+                value.unwrap() - ((block.p >> bit) & 1) as isize
+                    + ((block.m >> bit) & 1) as isize
+            })
+        };
+        (value, above)
+    }
+
+    /// On a retained traceback cell, a positive vertical delta means the cell
+    /// above costs one less. Avoid decoding that score with two popcounts.
+    pub fn can_insert(&self, row: usize, col: usize) -> bool {
+        let (first, range) = &self.columns[col - 1];
+        let local = (row - 1) / 64 - first;
+        // At a block boundary the predecessor may have been pruned. Row zero
+        // is the implicit matrix boundary and is always available.
+        if row > 1 && row % 64 == 1 && local == 0 {
+            return false;
+        }
+        self.blocks[range.start + local].p & (1 << ((row - 1) % 64)) != 0
+    }
+
+    fn push(&mut self, blocks: &[Block], first: usize, end: usize) {
+        let start = self.blocks.len();
+        self.blocks.extend_from_slice(&blocks[first..end]);
+        self.columns.push((first, start..self.blocks.len()));
+    }
+}
+
+/// The traced `global` for a one-block query, with the exact optimal distance
+/// as its bound. With one block, any band shrink in `global` empties the band
+/// and fails, which a known optimal path rules out. So every column retains
+/// exactly block zero, and band arithmetic, strong reductions and slice copies
+/// cannot change the trace. This records the identical blocks and column
+/// ranges and returns the final score.
+pub(crate) fn trace_single(profile: &Profile, target: Sequence<'_>, trace: &mut Trace) -> isize {
+    debug_assert_eq!(profile.blocks, 1);
+    let mut block = Block {
+        p: u64::MAX,
+        m: 0,
+        score: 64,
+    };
+    for c in 0..target.len() {
+        let mut carry = Deltas { p: 1, m: 0 };
+        advance(&mut block, profile.row(target.at(c))[0], &mut carry);
+        block.score += carry.value();
+        let start = trace.blocks.len();
+        trace.blocks.push(block);
+        trace.columns.push((0, start..start + 1));
+    }
+    block.value(profile.len - 1)
+}
+
+pub(crate) fn distance_global(profile: &Profile, target: Sequence<'_>, k: usize) -> Option<usize> {
+    if profile.len.abs_diff(target.len()) > k {
+        return None;
+    }
+
+    if profile.len <= 64 {
+        let (mut pv, mut mv, mut score) = (u64::MAX, 0, profile.len as isize);
+        let high = 1 << (profile.len - 1);
+        for c in 0..target.len() {
+            advance_single::<false>(
+                profile.row(target.at(c))[0],
+                high,
+                &mut pv,
+                &mut mv,
+                &mut score,
+            );
+            // A remaining column can decrease the actual last row by at most 1.
+            if score - (target.len() - c - 1) as isize > k as isize {
+                return None;
+            }
+        }
+        return (score <= k as isize).then_some(score as usize);
+    }
+
+    let column = global(profile, target, k, target.len(), None)?;
+    column
+        .value(profile.len)
+        .filter(|&s| s <= k as isize)
+        .map(|s| s as usize)
+}
+
+/// NW band restricted by both accumulated cost and mandatory remaining length
+/// imbalance. `stop` may be an interior column for Hirschberg, but `target.len`
+/// remains the full dimension: pruning must not mistake the midpoint for an end.
+pub(crate) fn global(
+    profile: &Profile,
+    target: Sequence<'_>,
+    bound: usize,
+    stop: usize,
+    mut trace: Option<&mut Trace>,
+) -> Option<Column> {
+    let (m, n, count) = (profile.len as isize, target.len() as isize, profile.blocks);
+    if profile.len.abs_diff(target.len()) > bound {
+        return None;
+    }
+
+    let mut k = bound.min(profile.len.max(target.len())) as isize;
+    let padding = count as isize * 64 - m;
+    let mut first = 0;
+    let mut end = count.min(((k.min((k + m - n) / 2) + 1) as usize).div_ceil(64));
+    let mut blocks: Vec<Block> = (0..count)
+        .map(|b| Block {
+            p: u64::MAX,
+            m: 0,
+            score: (b as isize + 1) * 64,
+        })
+        .collect();
+
+    for c in 0..stop {
+        let row = profile.row(target.at(c));
+        let mut carry = Deltas { p: 1, m: 0 };
+        // The last block's score stays in a register: the band checks below
+        // reload a score from memory only after the band actually shrinks.
+        let mut last_score = 0;
+        for (block, &eq) in blocks[first..end].iter_mut().zip(&row[first..end]) {
+            advance(block, eq, &mut carry);
+            block.score += carry.value();
+            last_score = block.score;
+        }
+        let c = c as isize;
+        k = k.min(
+            last_score
+                + (n - c - 1).max(m - end as isize * 64)
+                + if end == count { padding } else { 0 },
+        );
+
+        // Whole-block bounds deliberately allow up to 63 extra rows. Every
+        // 2048 columns, exact edge-cell bounds recover that slack.
+        if end < count && end as isize * 64 - 1 <= k - last_score + 126 - n + c + m {
+            let old_delta = carry.value();
+            blocks[end] = Block {
+                p: u64::MAX,
+                m: 0,
+                score: 0,
+            };
+            advance(&mut blocks[end], row[end], &mut carry);
+            last_score += 64 - old_delta + carry.value();
+            blocks[end].score = last_score;
+            end += 1;
+        }
+        while end > first {
+            if last_score < k + 64 && end as isize * 64 - 1 <= k - last_score + 127 - n + c + m {
+                break;
+            }
+            end -= 1;
+            if end > first {
+                last_score = blocks[end - 1].score;
+            }
+        }
+        while first < end {
+            let score = blocks[first].score;
+            if score < k + 64 && (first as isize + 1) * 64 - 1 >= score - k - n + m + c {
+                break;
+            }
+            first += 1;
+        }
+        if c % 2048 == 0 {
+            while end > first {
+                let b = end - 1;
+                let cells = if end == count {
+                    64 - padding as usize
+                } else {
+                    64
+                };
+                let viable = (0..cells).rev().any(|i| {
+                    let s = blocks[b].value(i);
+                    s <= k && (b * 64 + i) as isize <= k - s - n + c + m + 1
+                });
+                if viable {
+                    break;
+                }
+                end -= 1;
+            }
+            while first < end {
+                let cells = if first + 1 == count {
+                    64 - padding as usize
+                } else {
+                    64
+                };
+                let viable = (0..cells).rev().any(|i| {
+                    let s = blocks[first].value(i);
+                    s <= k && (first * 64 + i) as isize >= s - k - n + c + m
+                });
+                if viable {
+                    break;
+                }
+                first += 1;
+            }
+        }
+        if first == end {
+            return None;
+        }
+        if let Some(saved) = trace.as_mut() {
+            saved.push(&blocks, first, end);
+        }
+    }
+
+    Some(Column {
+        blocks,
+        first,
+        last: end - 1,
+    })
+}
+
+#[inline]
+fn report(
+    score: isize,
+    end: isize,
+    k: &mut isize,
+    best: &mut Option<usize>,
+    ends: &mut Vec<isize>,
+) {
+    if score <= *k {
+        if *best != Some(score as usize) {
+            ends.clear();
+            *best = Some(score as usize);
+            *k = score;
+        }
+        ends.push(end);
+    }
+}
+
+fn semi_single<const FREE: bool>(
+    profile: &Profile,
+    target: Sequence<'_>,
+    bound: usize,
+    ends: &mut Vec<isize>,
+) -> Option<usize> {
+    let (mut pv, mut mv, mut score) = (u64::MAX, 0, profile.len as isize);
+    let high = 1 << (profile.len - 1);
+    let mut k = bound.min(profile.len) as isize;
+    let mut best = None;
+    // Preserve the fork's endpoint convention: a full word does not expose
+    // boundary zero for a nonempty target (the padded kernel has no delay).
+    if profile.len < 64 {
+        report(score, -1, &mut k, &mut best, ends);
+    }
+    for c in 0..target.len() {
+        if !FREE && c >= profile.len + k as usize {
+            break;
+        }
+        advance_single::<FREE>(
+            profile.row(target.at(c))[0],
+            high,
+            &mut pv,
+            &mut mv,
+            &mut score,
+        );
+        report(score, c as isize, &mut k, &mut best, ends);
+    }
+    best
+}
+
+pub(crate) fn semiglobal(
+    profile: &Profile,
+    target: Sequence<'_>,
+    bound: usize,
+    free: bool,
+    ends: &mut Vec<isize>,
+) -> Option<usize> {
+    ends.clear();
+    if profile.len <= 64 {
+        return if free {
+            semi_single::<true>(profile, target, bound, ends)
+        } else {
+            semi_single::<false>(profile, target, bound, ends)
+        };
+    }
+    let count = profile.blocks;
+    let padding = count * 64 - profile.len;
+    let mut k = bound.min(profile.len) as isize;
+    let mut first = 0;
+    let mut end = count.min((k as usize + 1).div_ceil(64));
+    let mut blocks: Vec<Block> = (0..count)
+        .map(|b| Block {
+            p: u64::MAX,
+            m: 0,
+            score: (b as isize + 1) * 64,
+        })
+        .collect();
+    let mut best = None;
+    for c in 0..target.len() {
+        let row = profile.row(target.at(c));
+        let mut carry = Deltas {
+            p: u64::from(!free),
+            m: 0,
+        };
+        for (block, &eq) in blocks[first..end].iter_mut().zip(&row[first..end]) {
+            advance(block, eq, &mut carry);
+            block.score += carry.value();
+        }
+        if end < count
+            && blocks[end - 1].score - carry.value() <= k
+            && (row[end] & 1 != 0 || carry.m != 0)
+        {
+            let previous = blocks[end - 1].score;
+            let old_delta = carry.value();
+            blocks[end] = Block {
+                p: u64::MAX,
+                m: 0,
+                score: 0,
+            };
+            advance(&mut blocks[end], row[end], &mut carry);
+            blocks[end].score = previous - old_delta + 64 + carry.value();
+            end += 1;
+        } else {
+            while end > first && blocks[end - 1].score >= k + 64 {
+                end -= 1;
+            }
+        }
+        if c % 2048 == 0 {
+            while end > first && blocks[end - 1].all_larger(k) {
+                end -= 1;
+            }
+        }
+        // HW can restart at any column: its first block can never be discarded.
+        if free && end == 0 {
+            end = 1;
+        }
+        if !free {
+            while first < end && blocks[first].score >= k + 64 {
+                first += 1;
+            }
+            if c % 2048 == 0 {
+                while first < end && blocks[first].all_larger(k) {
+                    first += 1;
+                }
+            }
+        }
+        if end <= first {
+            return best;
+        }
+        if end == count {
+            // Wildcard padding delays a final-row score by `padding` columns.
+            report(
+                blocks[end - 1].score,
+                c as isize - padding as isize,
+                &mut k,
+                &mut best,
+                ends,
+            );
+        }
+    }
+    if end == count {
+        // Flush the delayed final endpoints from the final vertical deltas.
+        for i in 0..padding {
+            report(
+                blocks[end - 1].value(62 - i),
+                target.len() as isize - padding as isize + i as isize,
+                &mut k,
+                &mut best,
+                ends,
+            );
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EqualityPair, Profile, Sequence, Trace, distance_global, global, horizontal, trace_single,
+    };
+
+    /// The scatter construction, kept only as the bit-plane test oracle.
+    fn scatter_words(profile: &Profile, query: Sequence<'_>) -> Vec<u64> {
+        let rows = profile.words.len() / profile.blocks;
+        let mut words = vec![0; rows * profile.blocks];
+        for i in 0..query.len() {
+            words[profile.indices[query.at(i) as usize] as usize * profile.blocks + i / 64] |=
+                1 << (i % 64);
+        }
+        words
+    }
+
+    #[test]
+    fn bit_plane_profiles_equal_scatter_profiles() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % bound
+        };
+        let pairs = [EqualityPair::new(b'A', b'z'), EqualityPair::new(b'q', b'C')];
+        // 1..=9 distinct symbols span plane counts 1, 2 and 3 and the scatter fallback.
+        for symbols in 1..=9u32 {
+            for len in [1, 2, 31, 63, 64, 65, 127, 128, 129, 200, 513] {
+                let query: Vec<u8> = (0..len).map(|_| b"ACGTNacgt"[next(symbols) as usize]).collect();
+                for reverse in [false, true] {
+                    for extra in [&pairs[..0], &pairs[..]] {
+                        let sequence = if reverse { Sequence::reversed(&query) } else { Sequence::new(&query) };
+                        let profile = Profile::new(sequence, extra).unwrap();
+                        let mut expected = scatter_words(&profile, sequence);
+                        if !extra.is_empty() {
+                            Profile::add_equalities(&mut expected, &profile.indices, profile.blocks, sequence, extra);
+                        }
+                        if len % 64 != 0 {
+                            for row in expected.chunks_exact_mut(profile.blocks) {
+                                row[profile.blocks - 1] |= u64::MAX << (len % 64);
+                            }
+                        }
+                        assert_eq!(profile.words, expected, "{symbols} symbols, length {len}, reverse {reverse}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Myers' original formulation, kept only as the test oracle.
+    fn reference(eq: u64, pv: u64, mv: u64) -> (u64, u64) {
+        let xh = ((eq & pv).wrapping_add(pv) ^ pv) | eq;
+        (mv | !(xh | pv), pv & xh)
+    }
+
+    #[test]
+    fn shortened_horizontal_deltas_equal_myers_expressions() {
+        let edges = [0, 1, u64::MAX, u64::MAX - 1, 1 << 63, (1 << 63) - 1, 0x5555_5555_5555_5555];
+        for &eq in &edges {
+            for &pv in &edges {
+                for &mv in &edges {
+                    assert_eq!(horizontal(eq, pv, mv), reference(eq, pv, mv));
+                }
+            }
+        }
+        // SplitMix64: deterministic words, including carries across every bit.
+        let mut state = 0x5eed_ed1b_4285_fee6_u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        for _ in 0..1_000_000 {
+            let (eq, pv) = (next(), next());
+            // Valid Myers states never set a bit in both Pv and Mv.
+            let mv = next() & !pv;
+            assert_eq!(horizontal(eq, pv, mv), reference(eq, pv, mv));
+        }
+    }
+
+    #[test]
+    fn single_block_traces_equal_banded_global_traces() {
+        let mut state = 0x7ace_5eed_u32;
+        let mut next = |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % bound
+        };
+        let pairs = [EqualityPair::new(b'A', b'C')];
+        // Exact optimal bounds, including distance 0 and length-imbalanced
+        // targets, every one-block query length, padding and equalities.
+        for symbols in [1, 2, 4, 9] {
+            for len in 1..=64 {
+                for extra in [&pairs[..0], &pairs[..]] {
+                    for _ in 0..4 {
+                        let query: Vec<u8> = (0..len)
+                            .map(|_| b"ACGTNacgt"[next(symbols) as usize])
+                            .collect();
+                        let n = 1 + next(3 * len as u32) as usize;
+                        let target: Vec<u8> = (0..n)
+                            .map(|_| b"ACGTNacgt"[next(symbols) as usize])
+                            .collect();
+                        let profile = Profile::new(Sequence::new(&query), extra).unwrap();
+                        let distance =
+                            distance_global(&profile, Sequence::new(&target), len.max(n)).unwrap();
+                        let mut expected = Trace::new(1, n).unwrap();
+                        let column = global(
+                            &profile,
+                            Sequence::new(&target),
+                            distance,
+                            n,
+                            Some(&mut expected),
+                        )
+                        .unwrap();
+                        let mut actual = Trace::new(1, n).unwrap();
+                        let score = trace_single(&profile, Sequence::new(&target), &mut actual);
+                        assert_eq!(Some(score), column.value(len));
+                        assert_eq!(score, distance as isize);
+                        assert_eq!(actual.columns, expected.columns);
+                        let words = |t: &Trace| {
+                            t.blocks
+                                .iter()
+                                .map(|b| (b.p, b.m, b.score))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(words(&actual), words(&expected), "{query:?} {target:?}");
+                    }
+                }
+            }
+        }
+    }
+}
