@@ -11,12 +11,30 @@ Use Rust 1.85 or later. Add the crate from crates.io:
 cargo add rust-edlib
 ```
 
-## Example
+## Examples
 
-For an exact global score, `rust_edlib::distance(query, target)?` returns a
-`usize` without computing locations or an edit path.
+Each distance function scores the whole query. `rust_edlib::distance(query, target)`
+compares it with the whole target. Use `prefix_distance` for the minimum edit
+distance to any target prefix, or `suffix_distance` for the minimum distance
+to any target suffix. All three return `Result<usize, AlignError>` without
+collecting locations or building an edit path. The suffix search reads the
+slices backwards without copying them.
 
-For a bounded search, other alignment modes, or an edit path, use `align`:
+```rust
+use rust_edlib::{AlignError, distance, prefix_distance, suffix_distance};
+
+fn main() -> Result<(), AlignError> {
+    let target = b"CAGCAA";
+    assert_eq!(distance(b"CAG", target)?, 3);
+    assert_eq!(prefix_distance(b"CAG", target)?, 0);
+    assert_eq!(suffix_distance(b"CAA", target)?, 0);
+    assert_eq!(suffix_distance(b"CAG", target)?, 1); // Closest suffix: CAA.
+    Ok(())
+}
+```
+
+Use `align` if you need a distance bound, an infix match, locations, or an
+edit path:
 
 ```rust
 use rust_edlib::{AlignConfig, AlignError, AlignmentMode, AlignmentTask, CigarFormat, align};

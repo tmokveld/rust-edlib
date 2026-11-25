@@ -43,6 +43,49 @@ fn exhaustive_binary_inputs_all_modes_tasks_and_distance_bounds() {
 }
 
 #[test]
+fn score_only_anchored_distances_match_scalar_dp() {
+    use rust_edlib::{prefix_distance, suffix_distance};
+    let check = |q: &[u8], t: &[u8]| {
+        let reverse = |s: &[u8]| s.iter().rev().copied().collect::<Vec<_>>();
+        let oracle = |a: &[u8], b: &[u8]| quadratic(a, b, AlignmentMode::Prefix, &[]).distance;
+        assert_eq!(prefix_distance(q, t), Ok(oracle(q, t)));
+        assert_eq!(suffix_distance(q, t), Ok(oracle(&reverse(q), &reverse(t))));
+    };
+    let words = binary_strings(5);
+    for a in &words {
+        for b in &words {
+            check(a, b);
+        }
+    }
+    let mut rng = Rng::new(SEED);
+    for n in BOUNDARY_LENGTHS {
+        let query = rng.bytes(n);
+        for m in [63, 64, 65, 129, n, 3 * n] {
+            check(&query, &rng.bytes(m));
+        }
+        check(&query, &mutated(&mut rng, &query));
+    }
+}
+
+#[test]
+fn score_only_anchored_block_pruning_tracks_the_last_real_row() {
+    // Cross the 2048-column strong-pruning boundary and force multiple
+    // adaptive bands. Every query A absent from the target needs an edit,
+    // even if the target end is free. Substituting all B's attains the bound.
+    for len in [4095, 4096, 4097] {
+        let query = vec![b'A'; len];
+        let mut target = query.clone();
+        for b in target.iter_mut().step_by(23) {
+            *b = b'B';
+        }
+        target[len - 1] = b'B';
+        let differences = target.iter().filter(|&&b| b == b'B').count();
+        assert_eq!(rust_edlib::prefix_distance(&query, &target), Ok(differences));
+        assert_eq!(rust_edlib::suffix_distance(&query, &target), Ok(differences));
+    }
+}
+
+#[test]
 fn exhaustive_nontransitive_and_symmetric_equalities() {
     // 0~1 and 1~2 never imply 0~2, including after reversing a path.
     let pairs = [

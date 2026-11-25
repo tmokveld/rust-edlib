@@ -1,6 +1,7 @@
 //! Owned alignment results and borrowed configuration.
 
 use crate::kernel::{self, Profile, Sequence};
+use crate::myers;
 use std::{fmt, ops::Range};
 
 /// Which target gaps are free.
@@ -120,6 +121,65 @@ pub fn distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
     Ok(unbounded_distance(long.len(), |k| {
         kernel::distance_global(&profile, target, k)
     }))
+}
+
+/// Exact Levenshtein distance from the entire `query` to the best prefix of
+/// `target`, including its empty prefix. The trailing target bytes are free.
+/// Computes only the score, not locations or an edit path.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the search dimensions or required
+/// buffers cannot be accommodated.
+///
+/// ```
+/// assert_eq!(rust_edlib::prefix_distance(b"AC", b"ACTG")?, 0);
+/// assert_eq!(rust_edlib::prefix_distance(b"ACTG", b"AC")?, 2);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn prefix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
+    anchored_distance::<false>(query, target)
+}
+
+/// Exact Levenshtein distance from the entire `query` to the best suffix of
+/// `target`, including its empty suffix. The leading target bytes are free.
+/// Computes only the score, not locations or an edit path.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the search dimensions or required
+/// buffers cannot be accommodated.
+///
+/// ```
+/// assert_eq!(rust_edlib::suffix_distance(b"TG", b"ACTG")?, 0);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn suffix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
+    anchored_distance::<true>(query, target)
+}
+
+fn anchored_distance<const REVERSE: bool>(
+    query: &[u8],
+    target: &[u8],
+) -> Result<usize, AlignError> {
+    let shared = if REVERSE {
+        query.iter().rev().zip(target.iter().rev()).take_while(|(a, b)| a == b).count()
+    } else {
+        query.iter().zip(target).take_while(|(a, b)| a == b).count()
+    };
+    let m = query.len() - shared;
+    let n = target.len() - shared;
+    if m == 0 || n == 0 {
+        return Ok(m);
+    }
+    // The empty prefix/suffix costs m; consuming over 2m target bytes costs
+    // more than m from the length gap alone.
+    let extent = n.min(m.saturating_mul(2));
+    let (query, target) = if REVERSE {
+        (&query[..m], &target[n - extent..n])
+    } else {
+        (&query[shared..], &target[shared..shared + extent])
+    };
+    // Both slices are nonempty and their first bytes in traversal order differ.
+    myers::distance::<REVERSE>(query, target, m.saturating_sub(extent).max(1))
 }
 
 /// Align arbitrary bytes without copying the inputs. The result borrows neither
