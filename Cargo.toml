@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 description = "Native Rust bit-parallel Levenshtein alignment with Edlib semantics"
+repository = "https://github.com/tmokveld/rust-edlib"
 readme = "README.md"
 include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md"]
 

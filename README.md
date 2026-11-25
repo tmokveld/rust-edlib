@@ -5,12 +5,10 @@ with Edlib semantics.
 
 ## Installation
 
-Use Rust 1.85 or later. Add the checked-out library to your project's
-`Cargo.toml`, adjusting the path relative to that manifest:
+Use Rust 1.85 or later. Add the crate from crates.io:
 
-```toml
-[dependencies]
-rust-edlib = { path = "../rust-edlib" }
+```sh
+cargo add rust-edlib
 ```
 
 ## Example
