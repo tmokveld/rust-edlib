@@ -1,4 +1,4 @@
-//! Owned alignment results and borrowed configuration, following `edlib-rs` conventions.
+//! Owned alignment results and borrowed configuration.
 
 use crate::kernel::{self, Profile, Sequence};
 use std::{fmt, ops::Range};

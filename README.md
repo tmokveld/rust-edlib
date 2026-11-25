@@ -1,7 +1,7 @@
 # rust-edlib
 
-Exact, unit-cost Levenshtein alignment over byte slices, implemented in safe Rust
-with Edlib semantics.
+Exact, unit-cost Levenshtein alignment over byte slices in safe Rust. The
+library has no native dependencies or FFI.
 
 ## Installation
 
@@ -83,16 +83,15 @@ flanks. The result owns its buffers and is `Send + Sync`; accessors borrow
 without copying, and `cigar()` returns a formatter that writes directly to
 its destination.
 
-## Compatibility and edge cases
+## API notes and edge cases
 
-- Like `edlib-rs`, the API takes a borrowed configuration. Unlike the bindings,
-  it uses `usize` for distances and offsets, `isize` for inclusive ends, and
-  exposes no native types or C ABI. It does not interpret Unicode or support
-  affine gap penalties.
-- In `Prefix` and `Infix` modes, when the target is nonempty and the query
-  length is a positive multiple of 64, the optimized fork omits the
-  boundary-zero end even when it is optimal. This crate preserves that
-  convention for every task without changing the optimal distance.
+- The API borrows its configuration, uses `usize` for distances and offsets,
+  and uses `isize` for inclusive ends. It does not interpret Unicode or
+  support affine gap penalties.
+- In `Prefix` and `Infix` modes, a nonempty target and a query length that is
+  a positive multiple of 64 suppress the end at target offset zero, even if
+  it is optimal. This affects reported locations for every task, not the
+  edit distance.
 - Empty inputs still honor the task and bound. An empty global query deletes the
   entire target, an empty prefix query matches only `0..0`, and an empty infix
   query matches every boundary. An empty target consumes the query with
@@ -142,12 +141,8 @@ Open `target/doc/rust_edlib/index.html` to browse the generated API docs.
 ## CI and upstream benchmark
 
 [GitHub Actions](.github/workflows/ci.yml) tests debug and release builds on Rust
-1.85 with the C and C++ compilers disabled. A separate release job checks scores
-against [Martin Šošić's Edlib 1.3.9](https://github.com/Martinsos/edlib/tree/f8afceb49ab0095c852e0b8b488ae2c88e566afd)
-and reports median time per call on the same runner. It covers short and long
-global searches and bounded prefix hits and misses. The global Rust score-only
-call does not collect ends; Edlib's distance task always does. Score mismatches
-fail the job; timing differences do not.
+1.85 with the C and C++ compilers disabled. A separate release job compares
+against [Martin Šošić's Edlib 1.3.9](https://github.com/Martinsos/edlib/tree/f8afceb49ab0095c852e0b8b488ae2c88e566afd).
 
 To run the comparison locally with a C++ compiler:
 

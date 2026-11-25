@@ -1,15 +1,55 @@
 #include "edlib.h"
 
-extern "C" int upstream_distance(const char* query, int query_len,
-                                 const char* target, int target_len, int k) {
+static bool valid_path(const char* query, int query_len,
+                       const char* target, int target_len,
+                       EdlibAlignMode mode, const EdlibAlignResult& result) {
+    if (!result.alignment || result.numLocations < 1 ||
+        !result.startLocations || result.startLocations[0] != 0 ||
+        !result.endLocations) return false;
+    const int end = result.endLocations[0];
+    if (end < -1 || end >= target_len ||
+        (mode == EDLIB_MODE_NW && end != target_len - 1)) return false;
+    const int span_len = end + 1;
+    int q = 0, t = 0, cost = 0;
+    for (int i = 0; i < result.alignmentLength; ++i) {
+        const auto op = result.alignment[i];
+        switch (op) {
+            case EDLIB_EDOP_MATCH:
+            case EDLIB_EDOP_MISMATCH:
+                if (q == query_len || t == span_len ||
+                    (query[q] == target[t]) != (op == EDLIB_EDOP_MATCH)) return false;
+                ++q;
+                ++t;
+                break;
+            case EDLIB_EDOP_INSERT:
+                if (q == query_len) return false;
+                ++q;
+                break;
+            case EDLIB_EDOP_DELETE:
+                if (t == span_len) return false;
+                ++t;
+                break;
+            default:
+                return false;
+        }
+        cost += op != EDLIB_EDOP_MATCH;
+    }
+    return q == query_len && t == span_len && cost == result.editDistance;
+}
+
+extern "C" int upstream_align(const char* query, int query_len,
+                              const char* target, int target_len, int k,
+                              bool path, bool check_path) {
     // The benchmark uses unbounded global and bounded prefix searches.
     const auto mode = k < 0 ? EDLIB_MODE_NW : EDLIB_MODE_SHW;
-    const EdlibAlignConfig config{k, mode, EDLIB_TASK_DISTANCE, nullptr, 0};
+    const auto task = path ? EDLIB_TASK_PATH : EDLIB_TASK_DISTANCE;
+    const EdlibAlignConfig config{k, mode, task, nullptr, 0};
     const auto result = edlibAlign(query, query_len, target, target_len, config);
     if (result.status != EDLIB_STATUS_OK) {
         return -2;
     }
-    const int distance = result.editDistance;
+    const int distance = check_path && !valid_path(query, query_len, target, target_len, mode, result)
+        ? -3 : result.editDistance;
     edlibFreeAlignResult(result);
     return distance;
 }
