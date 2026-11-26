@@ -123,13 +123,18 @@ its destination.
 
 ## Algorithm and memory
 
-The distance kernel uses Myers bit vectors with Ukkonen band pruning. Queries
-of up to 64 bytes use a single 64-bit word. Without an explicit bound, the
-search starts at 64 or the largest feasible distance if smaller, and doubles
-the bound as needed up to that limit. The kernel reads inputs without copying
-them, including when traversing in reverse. Infix start recovery runs a
-reverse prefix search per reported end, so many ties can make `Locations` and
-`Path` more expensive than `Distance`.
+The distance kernel uses Myers bit vectors with Ukkonen band pruning. Global
+and anchored score searches can advance two adjacent 64-row blocks with one
+`u128` addition, retaining the score of each block. A partial anchored block
+tracks its last real row.
+
+The score-only functions grow the budget above the mandatory length gap. An
+anchored miss also uses the query extent of the failed band to choose the
+next budget. This is a prediction, not a bound: every wider pass restarts
+from column zero. `align` with no explicit bound retains its doubling search.
+Inputs are borrowed, even in reverse. Infix start recovery runs a reverse
+prefix search per reported end, so many ties can make `Locations` and `Path`
+more expensive than `Distance`.
 
 Path reconstruction starts from the query profile built for the distance search.
 Short path problems keep packed traceback columns. Once the optimal distance is

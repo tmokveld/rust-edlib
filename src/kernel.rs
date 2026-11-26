@@ -8,6 +8,11 @@ pub(crate) fn check_buffer<T>(len: usize) -> Result<(), AlignError> {
         .ok_or(AlignError::InputTooLong)
 }
 
+/// Initial budget above the mandatory gap for unbounded score-only searches.
+pub(crate) fn initial_slack(gap: usize, overlap: usize) -> usize {
+    (gap.min(overlap) / 4).max(64)
+}
+
 /// Reversed traversal without copying input bytes.
 #[derive(Clone, Copy)]
 pub(crate) struct Sequence<'a> {
@@ -186,6 +191,22 @@ pub(crate) struct Block {
 }
 
 impl Block {
+    pub(crate) fn new(score: isize) -> Self {
+        Self { p: u64::MAX, m: 0, score }
+    }
+
+    #[inline]
+    pub(crate) fn advance(&mut self, eq: u64, carry: Deltas, high: usize) -> Deltas {
+        let xv = eq | self.m;
+        let (ph, mh) = horizontal(eq | carry.m, self.p, self.m);
+        let next = Deltas { p: (ph >> high) & 1, m: (mh >> high) & 1 };
+        let ph = (ph << 1) | carry.p;
+        self.p = (mh << 1) | carry.m | !(xv | ph);
+        self.m = ph & xv;
+        self.score += next.value();
+        next
+    }
+
     /// Vertical differences encode D[r,c]-D[r-1,c]. Bits above the requested
     /// row must be subtracted from the bottom score; popcount avoids 64 steps.
     #[inline]
@@ -193,9 +214,9 @@ impl Block {
         let mask = if row == 63 { 0 } else { u64::MAX << (row + 1) };
         self.score - (self.p & mask).count_ones() as isize + (self.m & mask).count_ones() as isize
     }
-    fn all_larger(self, k: isize) -> bool {
+    pub(crate) fn all_larger(self, k: isize, width: usize) -> bool {
         let mut value = self.score;
-        for i in (0..64).rev() {
+        for i in (0..width).rev() {
             if value <= k {
                 return false;
             }
@@ -208,14 +229,17 @@ impl Block {
 
 /// Split +/- horizontal carries avoid decoding/re-encoding between words.
 #[derive(Clone, Copy)]
-struct Deltas {
+pub(crate) struct Deltas {
     p: u64,
-    m: u64,
+    pub(crate) m: u64,
 }
 
 impl Deltas {
+    // D[0,c] = c when the leading target end is not free.
+    pub(crate) const ANCHORED: Self = Self { p: 1, m: 0 };
+
     #[inline]
-    fn value(self) -> isize {
+    pub(crate) fn value(self) -> isize {
         self.p as isize - self.m as isize
     }
 }
@@ -231,21 +255,42 @@ fn horizontal(eq: u64, pv: u64, mv: u64) -> (u64, u64) {
     (mv | !(sum | (eq | pv)), pv & (eq | !sum))
 }
 
+/// Advance complete 64-row blocks. In Myers' multiword sum `(Eq & Pv) + Pv`,
+/// the carry out of one half is exactly its high `Mh` bit. A `u128` addition
+/// delivers it directly to the next half; bits 63 and 127 still give the
+/// two separate bottom-score deltas needed by pruning and traceback.
 #[inline]
-fn advance(block: &mut Block, mut eq: u64, carry: &mut Deltas) {
-    let (pv, mv) = (block.p, block.m);
-    let xv = eq | mv;
-    eq |= carry.m;
-    let (ph, mh) = horizontal(eq, pv, mv);
-    let next = Deltas {
-        p: ph >> 63,
-        m: mh >> 63,
-    };
-    let ph = (ph << 1) | carry.p;
-    let mh = (mh << 1) | carry.m;
-    block.p = mh | !(xv | ph);
-    block.m = ph & xv;
-    *carry = next;
+pub(crate) fn advance_words(blocks: &mut [Block], row: &[u64], carry: &mut Deltas) -> isize {
+    debug_assert_eq!(blocks.len(), row.len());
+    let join = |a: u64, b: u64| u128::from(a) | (u128::from(b) << 64);
+    let mut pairs = blocks.chunks_exact_mut(2);
+    let mut eqs = row.chunks_exact(2);
+    let mut last = 0;
+    for (b, e) in pairs.by_ref().zip(eqs.by_ref()) {
+        let pv = join(b[0].p, b[1].p);
+        let mv = join(b[0].m, b[1].m);
+        let eq = join(e[0], e[1]);
+        let xv = eq | mv;
+        let eq = eq | u128::from(carry.m);
+        let sum = (eq & pv).wrapping_add(pv);
+        let ph = mv | !(sum | (eq | pv));
+        let mh = pv & (eq | !sum);
+        b[0].score += (ph as u64 >> 63) as isize - (mh as u64 >> 63) as isize;
+        let next = Deltas { p: (ph >> 127) as u64, m: (mh >> 127) as u64 };
+        b[1].score += next.value();
+        last = b[1].score;
+        let ph = (ph << 1) | u128::from(carry.p);
+        let pv = (mh << 1) | u128::from(carry.m) | !(xv | ph);
+        let mv = ph & xv;
+        (b[0].p, b[1].p) = (pv as u64, (pv >> 64) as u64);
+        (b[0].m, b[1].m) = (mv as u64, (mv >> 64) as u64);
+        *carry = next;
+    }
+    if let ([block], [eq]) = (pairs.into_remainder(), eqs.remainder()) {
+        *carry = block.advance(*eq, *carry, 63);
+        last = block.score;
+    }
+    last
 }
 
 #[inline]
@@ -358,15 +403,9 @@ impl Trace {
 /// ranges and returns the final score.
 pub(crate) fn trace_single(profile: &Profile, target: Sequence<'_>, trace: &mut Trace) -> isize {
     debug_assert_eq!(profile.blocks, 1);
-    let mut block = Block {
-        p: u64::MAX,
-        m: 0,
-        score: 64,
-    };
+    let mut block = Block::new(64);
     for c in 0..target.len() {
-        let mut carry = Deltas { p: 1, m: 0 };
-        advance(&mut block, profile.row(target.at(c))[0], &mut carry);
-        block.score += carry.value();
+        block.advance(profile.row(target.at(c))[0], Deltas::ANCHORED, 63);
         let start = trace.blocks.len();
         trace.blocks.push(block);
         trace.columns.push((0, start..start + 1));
@@ -425,24 +464,15 @@ pub(crate) fn global(
     let mut first = 0;
     let mut end = count.min(((k.min((k + m - n) / 2) + 1) as usize).div_ceil(64));
     let mut blocks: Vec<Block> = (0..count)
-        .map(|b| Block {
-            p: u64::MAX,
-            m: 0,
-            score: (b as isize + 1) * 64,
-        })
+        .map(|b| Block::new((b as isize + 1) * 64))
         .collect();
 
     for c in 0..stop {
         let row = profile.row(target.at(c));
-        let mut carry = Deltas { p: 1, m: 0 };
+        let mut carry = Deltas::ANCHORED;
         // The last block's score stays in a register: the band checks below
         // reload a score from memory only after the band actually shrinks.
-        let mut last_score = 0;
-        for (block, &eq) in blocks[first..end].iter_mut().zip(&row[first..end]) {
-            advance(block, eq, &mut carry);
-            block.score += carry.value();
-            last_score = block.score;
-        }
+        let mut last_score = advance_words(&mut blocks[first..end], &row[first..end], &mut carry);
         let c = c as isize;
         k = k.min(
             last_score
@@ -453,15 +483,10 @@ pub(crate) fn global(
         // Whole-block bounds deliberately allow up to 63 extra rows. Every
         // 2048 columns, exact edge-cell bounds recover that slack.
         if end < count && end as isize * 64 - 1 <= k - last_score + 126 - n + c + m {
-            let old_delta = carry.value();
-            blocks[end] = Block {
-                p: u64::MAX,
-                m: 0,
-                score: 0,
-            };
-            advance(&mut blocks[end], row[end], &mut carry);
-            last_score += 64 - old_delta + carry.value();
-            blocks[end].score = last_score;
+            let mut block = Block::new(last_score + 64 - carry.value());
+            block.advance(row[end], carry, 63);
+            last_score = block.score;
+            blocks[end] = block;
             end += 1;
         }
         while end > first {
@@ -598,11 +623,7 @@ pub(crate) fn semiglobal(
     let mut first = 0;
     let mut end = count.min((k as usize + 1).div_ceil(64));
     let mut blocks: Vec<Block> = (0..count)
-        .map(|b| Block {
-            p: u64::MAX,
-            m: 0,
-            score: (b as isize + 1) * 64,
-        })
+        .map(|b| Block::new((b as isize + 1) * 64))
         .collect();
     let mut best = None;
     for c in 0..target.len() {
@@ -612,22 +633,15 @@ pub(crate) fn semiglobal(
             m: 0,
         };
         for (block, &eq) in blocks[first..end].iter_mut().zip(&row[first..end]) {
-            advance(block, eq, &mut carry);
-            block.score += carry.value();
+            carry = block.advance(eq, carry, 63);
         }
         if end < count
             && blocks[end - 1].score - carry.value() <= k
             && (row[end] & 1 != 0 || carry.m != 0)
         {
-            let previous = blocks[end - 1].score;
-            let old_delta = carry.value();
-            blocks[end] = Block {
-                p: u64::MAX,
-                m: 0,
-                score: 0,
-            };
-            advance(&mut blocks[end], row[end], &mut carry);
-            blocks[end].score = previous - old_delta + 64 + carry.value();
+            let mut block = Block::new(blocks[end - 1].score - carry.value() + 64);
+            block.advance(row[end], carry, 63);
+            blocks[end] = block;
             end += 1;
         } else {
             while end > first && blocks[end - 1].score >= k + 64 {
@@ -635,7 +649,7 @@ pub(crate) fn semiglobal(
             }
         }
         if c % 2048 == 0 {
-            while end > first && blocks[end - 1].all_larger(k) {
+            while end > first && blocks[end - 1].all_larger(k, 64) {
                 end -= 1;
             }
         }
@@ -648,7 +662,7 @@ pub(crate) fn semiglobal(
                 first += 1;
             }
             if c % 2048 == 0 {
-                while first < end && blocks[first].all_larger(k) {
+                while first < end && blocks[first].all_larger(k, 64) {
                     first += 1;
                 }
             }

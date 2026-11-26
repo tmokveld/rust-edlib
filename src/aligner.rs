@@ -118,9 +118,18 @@ pub fn distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
     }
     let profile = Profile::new(Sequence::new(short), &[])?;
     let target = Sequence::new(long);
-    Ok(unbounded_distance(long.len(), |k| {
-        kernel::distance_global(&profile, target, k)
-    }))
+    // The mandatory insertions are not an estimate of divergence. Grow
+    // the allowance for edits *in excess* of the length difference instead
+    // of rounding the entire distance up to the next power of two.
+    let gap = long.len() - short.len();
+    let mut slack = kernel::initial_slack(gap, short.len());
+    loop {
+        let k = gap + slack.min(short.len());
+        if let Some(d) = kernel::distance_global(&profile, target, k) {
+            return Ok(d);
+        }
+        slack *= 2;
+    }
 }
 
 /// Exact Levenshtein distance from the entire `query` to the best prefix of

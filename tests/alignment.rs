@@ -43,11 +43,14 @@ fn exhaustive_binary_inputs_all_modes_tasks_and_distance_bounds() {
 }
 
 #[test]
-fn score_only_anchored_distances_match_scalar_dp() {
-    use rust_edlib::{prefix_distance, suffix_distance};
+fn score_only_distances_match_scalar_dp() {
+    use rust_edlib::{distance, prefix_distance, suffix_distance};
     let check = |q: &[u8], t: &[u8]| {
         let reverse = |s: &[u8]| s.iter().rev().copied().collect::<Vec<_>>();
         let oracle = |a: &[u8], b: &[u8]| quadratic(a, b, AlignmentMode::Prefix, &[]).distance;
+        let global = quadratic(q, t, AlignmentMode::Global, &[]).distance;
+        assert_eq!(distance(q, t), Ok(global));
+        assert_eq!(distance(t, q), Ok(global));
         assert_eq!(prefix_distance(q, t), Ok(oracle(q, t)));
         assert_eq!(suffix_distance(q, t), Ok(oracle(&reverse(q), &reverse(t))));
     };
@@ -65,6 +68,16 @@ fn score_only_anchored_distances_match_scalar_dp() {
         }
         check(&query, &mutated(&mut rng, &query));
     }
+    // An expensive pinned end and a cheap remainder give different retry
+    // predictions in opposite directions. Neither can fix an endpoint.
+    let query = rng.bytes(513);
+    let mut target = query.clone();
+    target[1..193].fill(255);
+    target.splice(257..257, [0; 193]);
+    target[0] ^= 1;
+    *target.last_mut().unwrap() ^= 1;
+    check(&query, &target);
+    check(&target, &query);
 }
 
 #[test]

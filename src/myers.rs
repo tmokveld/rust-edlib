@@ -1,6 +1,7 @@
 //! Score-only anchored Myers search.
 
 use crate::AlignError;
+use crate::kernel::{Block, Deltas, advance_words, initial_slack};
 
 /// The caller has trimmed the shared pinned end and cropped the free end.
 /// `lower` is a proven lower bound on the distance, including any failed probe.
@@ -31,15 +32,19 @@ pub(crate) fn distance<const REVERSE: bool>(
         .map_err(|_| AlignError::InputTooLong)?;
     // The empty target prefix costs m. Only search for a strict improvement.
     let upper = m - 1;
-    let mut bound = lower.max(64).min(upper);
+    let gap = m.saturating_sub(target.len());
+    let mut bound = (gap + initial_slack(gap, target.len())).max(lower).min(upper);
     loop {
-        if let Some(score) = banded::<REVERSE>(&profile, target, lower, bound, &mut blocks) {
-            return Ok(score);
-        }
-        if bound == upper {
-            return Ok(m);
-        }
-        bound = (2 * bound).min(upper);
+        let reach = match banded::<REVERSE>(&profile, target, lower, bound, &mut blocks) {
+            Pass::Hit(score) => return Ok(score),
+            Pass::Miss(_) if bound == upper => return Ok(m),
+            Pass::Miss(reach) => reach,
+        };
+        // The failed pass's query extent predicts a useful budget, not a
+        // lower bound. Start again from the pinned end at the new budget.
+        let forecast = bound.saturating_mul(m) / reach;
+        let grown = bound + (bound - gap);
+        bound = grown.max(forecast.min(bound.saturating_mul(16))).min(upper);
     }
 }
 
@@ -130,70 +135,6 @@ impl Profile {
     }
 }
 
-/// Split positive and negative horizontal carries between words.
-#[derive(Clone, Copy)]
-struct Deltas {
-    p: u64,
-    m: u64,
-}
-
-impl Deltas {
-    // D[0, c] = c: target bytes before the first query byte are not free.
-    const ANCHORED: Self = Self { p: 1, m: 0 };
-
-    #[inline]
-    fn value(self) -> isize {
-        self.p as isize - self.m as isize
-    }
-}
-
-struct Block {
-    p: u64,
-    m: u64,
-    score: isize,
-}
-
-impl Block {
-    fn new(score: isize) -> Self {
-        Self {
-            p: u64::MAX,
-            m: 0,
-            score,
-        }
-    }
-
-    #[inline]
-    fn advance(&mut self, eq: u64, carry: Deltas, high: usize) -> Deltas {
-        let xv = eq | self.m;
-        let eq = eq | carry.m;
-        // Myers' horizontal deltas, without materializing Xh = (sum ^ p) | eq.
-        let sum = (eq & self.p).wrapping_add(self.p);
-        let ph = self.m | !(sum | (eq | self.p));
-        let mh = self.p & (eq | !sum);
-        let next = Deltas {
-            p: (ph >> high) & 1,
-            m: (mh >> high) & 1,
-        };
-        let ph = (ph << 1) | carry.p;
-        self.p = (mh << 1) | carry.m | !(xv | ph);
-        self.m = ph & xv;
-        self.score += next.value();
-        next
-    }
-
-    fn all_larger(&self, k: isize, width: usize) -> bool {
-        let mut score = self.score;
-        for i in (0..width).rev() {
-            if score <= k {
-                return false;
-            }
-            score -= ((self.p >> i) & 1) as isize;
-            score += ((self.m >> i) & 1) as isize;
-        }
-        true
-    }
-}
-
 fn single<const REVERSE: bool>(query: &[u8], target: &[u8], lower: usize) -> usize {
     let mut row = [0u64; 256];
     for (i, symbol) in bytes::<REVERSE>(query).enumerate() {
@@ -215,13 +156,19 @@ fn single<const REVERSE: bool>(query: &[u8], target: &[u8], lower: usize) -> usi
     best
 }
 
+enum Pass {
+    Hit(usize),
+    // Query extent of the last nonempty band, not a reachable endpoint.
+    Miss(usize),
+}
+
 fn banded<const REVERSE: bool>(
     profile: &Profile,
     target: &[u8],
     lower: usize,
     bound: usize,
     blocks: &mut Vec<Block>,
-) -> Option<usize> {
+) -> Pass {
     let m = profile.len;
     let count = profile.count;
     let last = count - 1;
@@ -244,11 +191,8 @@ fn banded<const REVERSE: bool>(
         let mut end = blocks.len();
         let full_end = end.min(last);
         let mut carry = Deltas::ANCHORED;
-        let mut last_score = 0;
-        for (block, &eq) in blocks[first..full_end].iter_mut().zip(&row[first..full_end]) {
-            carry = block.advance(eq, carry, 63);
-            last_score = block.score;
-        }
+        let last_score =
+            advance_words(&mut blocks[first..full_end], &row[first..full_end], &mut carry);
         if end == count {
             blocks[last].advance(row[last], carry, tail - 1);
         }
@@ -294,5 +238,9 @@ fn banded<const REVERSE: bool>(
             }
         }
     }
-    found.then_some(k as usize)
+    if found {
+        Pass::Hit(k as usize)
+    } else {
+        Pass::Miss((blocks.len() * 64).min(m))
+    }
 }
