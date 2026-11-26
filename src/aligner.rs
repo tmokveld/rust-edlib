@@ -146,7 +146,25 @@ pub fn distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
 /// # Ok::<(), rust_edlib::AlignError>(())
 /// ```
 pub fn prefix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
-    anchored_distance::<false>(query, target)
+    Ok(prefix_distance_at_most(query, target, query.len())?
+        .expect("the empty prefix is within the query-length bound"))
+}
+
+/// Exact [`prefix_distance`] up to the inclusive cutoff `k`, without collecting
+/// endpoints or a path. Returns `Ok(None)` if even the best prefix costs more.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
+/// cannot be accommodated.
+///
+/// ```
+/// assert_eq!(rust_edlib::prefix_distance_at_most(b"cat", b"cutlass", 1)?, Some(1));
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn prefix_distance_at_most(
+    query: &[u8], target: &[u8], k: usize,
+) -> Result<Option<usize>, AlignError> {
+    anchored_distance::<false>(query, target, k)
 }
 
 /// Exact Levenshtein distance from the entire `query` to the best suffix of
@@ -162,13 +180,35 @@ pub fn prefix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError>
 /// # Ok::<(), rust_edlib::AlignError>(())
 /// ```
 pub fn suffix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
-    anchored_distance::<true>(query, target)
+    Ok(suffix_distance_at_most(query, target, query.len())?
+        .expect("the empty suffix is within the query-length bound"))
+}
+
+/// Exact [`suffix_distance`] up to the inclusive cutoff `k`, without collecting
+/// endpoints or a path. Returns `Ok(None)` if even the best suffix costs more.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
+/// cannot be accommodated.
+///
+/// ```
+/// assert_eq!(rust_edlib::suffix_distance_at_most(b"cat", b"shortcut", 0)?, None);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn suffix_distance_at_most(
+    query: &[u8], target: &[u8], k: usize,
+) -> Result<Option<usize>, AlignError> {
+    anchored_distance::<true>(query, target, k)
 }
 
 fn anchored_distance<const REVERSE: bool>(
     query: &[u8],
     target: &[u8],
-) -> Result<usize, AlignError> {
+    k: usize,
+) -> Result<Option<usize>, AlignError> {
+    if query.len().saturating_sub(target.len()) > k {
+        return Ok(None);
+    }
     let shared = if REVERSE {
         query.iter().rev().zip(target.iter().rev()).take_while(|(a, b)| a == b).count()
     } else {
@@ -177,18 +217,22 @@ fn anchored_distance<const REVERSE: bool>(
     let m = query.len() - shared;
     let n = target.len() - shared;
     if m == 0 || n == 0 {
-        return Ok(m);
+        return Ok(Some(m));
     }
-    // The empty prefix/suffix costs m; consuming over 2m target bytes costs
-    // more than m from the length gap alone.
-    let extent = n.min(m.saturating_mul(2));
+    if k == 0 {
+        return Ok(None); // The first remaining bytes at the pinned end differ.
+    }
+    // Deleting the remaining query costs m. Any longer target flank than
+    // m + min(k, m) loses on length difference alone.
+    let limit = k.min(m);
+    let extent = n.min(m.saturating_add(limit));
     let (query, target) = if REVERSE {
         (&query[..m], &target[n - extent..n])
     } else {
         (&query[shared..], &target[shared..shared + extent])
     };
     // Both slices are nonempty and their first bytes in traversal order differ.
-    myers::distance::<REVERSE>(query, target, m.saturating_sub(extent).max(1))
+    myers::distance::<REVERSE>(query, target, m.saturating_sub(extent).max(1), limit)
 }
 
 /// Align arbitrary bytes without copying the inputs. The result borrows neither

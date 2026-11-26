@@ -4,19 +4,20 @@ use crate::AlignError;
 use crate::kernel::{Block, Deltas, advance_words, initial_slack};
 
 /// The caller has trimmed the shared pinned end and cropped the free end.
-/// `lower` is a proven lower bound on the distance, including any failed probe.
+/// `lower` is a proven lower bound; `limit` is the inclusive cutoff.
 pub(crate) fn distance<const REVERSE: bool>(
     query: &[u8],
     target: &[u8],
     lower: usize,
-) -> Result<usize, AlignError> {
+    limit: usize,
+) -> Result<Option<usize>, AlignError> {
     let m = query.len();
-    debug_assert!(lower <= m);
-    if target.is_empty() || lower == m {
-        return Ok(m);
+    debug_assert!(lower <= limit && limit <= m);
+    if lower == m {
+        return Ok(Some(m));
     }
     if m <= 64 {
-        return Ok(single::<REVERSE>(query, target, lower));
+        return Ok(single::<REVERSE>(query, target, lower, limit));
     }
 
     // Even an inactive edge reconstructed via deletions costs at most row +
@@ -30,14 +31,19 @@ pub(crate) fn distance<const REVERSE: bool>(
     blocks
         .try_reserve_exact(profile.count)
         .map_err(|_| AlignError::InputTooLong)?;
-    // The empty target prefix costs m. Only search for a strict improvement.
-    let upper = m - 1;
+    // Only use the empty flank as an incumbent when it is within the cutoff.
+    let empty = (limit == m).then_some(m);
+    let upper = limit.min(m - 1);
     let gap = m.saturating_sub(target.len());
-    let mut bound = (gap + initial_slack(gap, target.len())).max(lower).min(upper);
+    let mut bound = if limit < m {
+        limit
+    } else {
+        (gap + initial_slack(gap, target.len())).max(lower).min(upper)
+    };
     loop {
         let reach = match banded::<REVERSE>(&profile, target, lower, bound, &mut blocks) {
-            Pass::Hit(score) => return Ok(score),
-            Pass::Miss(_) if bound == upper => return Ok(m),
+            Pass::Hit(score) => return Ok(Some(score)),
+            Pass::Miss(_) if bound == upper => return Ok(empty),
             Pass::Miss(reach) => reach,
         };
         // The failed pass's query extent predicts a useful budget, not a
@@ -135,13 +141,15 @@ impl Profile {
     }
 }
 
-fn single<const REVERSE: bool>(query: &[u8], target: &[u8], lower: usize) -> usize {
+fn single<const REVERSE: bool>(
+    query: &[u8], target: &[u8], lower: usize, limit: usize,
+) -> Option<usize> {
     let mut row = [0u64; 256];
     for (i, symbol) in bytes::<REVERSE>(query).enumerate() {
         row[symbol as usize] |= 1 << i;
     }
     let m = query.len();
-    let mut best = m;
+    let mut best = m.min(limit + 1); // No hit yet if the empty flank exceeds the cutoff.
     let mut block = Block::new(m as isize);
     for (c, symbol) in bytes::<REVERSE>(target).enumerate() {
         if c + 1 >= m + best {
@@ -149,11 +157,12 @@ fn single<const REVERSE: bool>(query: &[u8], target: &[u8], lower: usize) -> usi
         }
         block.advance(row[symbol as usize], Deltas::ANCHORED, m - 1);
         best = best.min(block.score as usize);
-        if best == lower {
+        // Each remaining column can reduce the last-row score by at most one.
+        if best == lower || block.score as usize >= best + (target.len() - c - 1) {
             break;
         }
     }
-    best
+    (best <= limit).then_some(best)
 }
 
 enum Pass {

@@ -1,7 +1,6 @@
 # rust-edlib
 
-Exact, unit-cost Levenshtein alignment over byte slices in safe Rust. The
-library has no native dependencies or FFI.
+Exact, unit-cost Levenshtein alignment over byte slices in safe Rust.
 
 ## Installation
 
@@ -33,8 +32,12 @@ fn main() -> Result<(), AlignError> {
 }
 ```
 
-Use `align` if you need a distance bound, an infix match, locations, or an
-edit path:
+For score-only searches with an inclusive cutoff `k`, `prefix_distance_at_most`
+and `suffix_distance_at_most` return `Ok(Some(d))` for the exact best score
+at or below `k`, or `Ok(None)` if every flank (including the empty one) costs
+more. A sizing or allocation failure is an error, not a cutoff miss.
+
+Use `align` for a bounded global alignment, an infix match, locations, or an edit path:
 
 ```rust
 use rust_edlib::{AlignConfig, AlignError, AlignmentMode, AlignmentTask, CigarFormat, align};
@@ -128,10 +131,12 @@ and anchored score searches can advance two adjacent 64-row blocks with one
 `u128` addition, retaining the score of each block. A partial anchored block
 tracks its last real row.
 
-The score-only functions grow the budget above the mandatory length gap. An
+The unbounded score-only functions grow the budget above the mandatory length gap. An
 anchored miss also uses the query extent of the failed band to choose the
 next budget. This is a prediction, not a bound: every wider pass restarts
 from column zero. `align` with no explicit bound retains its doubling search.
+For a cutoff smaller than the cost of deleting the remaining query, the
+multiword anchored scorer uses a single band at that cutoff.
 Inputs are borrowed, even in reverse. Infix start recovery runs a reverse
 prefix search per reported end, so many ties can make `Locations` and `Path`
 more expensive than `Distance`.

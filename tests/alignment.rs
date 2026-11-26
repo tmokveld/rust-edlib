@@ -44,15 +44,25 @@ fn exhaustive_binary_inputs_all_modes_tasks_and_distance_bounds() {
 
 #[test]
 fn score_only_distances_match_scalar_dp() {
-    use rust_edlib::{distance, prefix_distance, suffix_distance};
+    use rust_edlib::{
+        distance, prefix_distance, prefix_distance_at_most, suffix_distance, suffix_distance_at_most,
+    };
     let check = |q: &[u8], t: &[u8]| {
         let reverse = |s: &[u8]| s.iter().rev().copied().collect::<Vec<_>>();
         let oracle = |a: &[u8], b: &[u8]| quadratic(a, b, AlignmentMode::Prefix, &[]).distance;
         let global = quadratic(q, t, AlignmentMode::Global, &[]).distance;
         assert_eq!(distance(q, t), Ok(global));
         assert_eq!(distance(t, q), Ok(global));
-        assert_eq!(prefix_distance(q, t), Ok(oracle(q, t)));
-        assert_eq!(suffix_distance(q, t), Ok(oracle(&reverse(q), &reverse(t))));
+        let prefix = oracle(q, t);
+        let suffix = oracle(&reverse(q), &reverse(t));
+        assert_eq!(prefix_distance(q, t), Ok(prefix));
+        assert_eq!(suffix_distance(q, t), Ok(suffix));
+        let scorers = [prefix_distance_at_most, suffix_distance_at_most];
+        for (score, d) in scorers.into_iter().zip([prefix, suffix]) {
+            for k in limits(d).into_iter().flatten() {
+                assert_eq!(score(q, t, k), Ok((d <= k).then_some(d)));
+            }
+        }
     };
     let words = binary_strings(5);
     for a in &words {
@@ -95,6 +105,10 @@ fn score_only_anchored_block_pruning_tracks_the_last_real_row() {
         let differences = target.iter().filter(|&&b| b == b'B').count();
         assert_eq!(rust_edlib::prefix_distance(&query, &target), Ok(differences));
         assert_eq!(rust_edlib::suffix_distance(&query, &target), Ok(differences));
+        for score in [rust_edlib::prefix_distance_at_most, rust_edlib::suffix_distance_at_most] {
+            assert_eq!(score(&query, &target, differences - 1), Ok(None));
+            assert_eq!(score(&query, &target, differences), Ok(Some(differences)));
+        }
     }
 }
 
