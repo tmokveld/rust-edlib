@@ -99,8 +99,7 @@ impl Profile {
         if !pairs.is_empty() {
             Self::add_equalities(&mut words, &indices, blocks, query, pairs);
         }
-        // Padding is a suffix of wildcard rows. It cannot influence any real
-        // query row; semi-global reporting uses the resulting diagonal delay.
+        // A suffix of wildcard padding cannot influence any real query row.
         let used = query.len() % 64;
         if used != 0 {
             let padding = u64::MAX << used;
@@ -553,95 +552,115 @@ pub(crate) fn global(
     })
 }
 
-#[inline]
-fn report(
-    score: isize,
-    end: isize,
-    k: &mut isize,
-    best: &mut Option<usize>,
-    ends: &mut Vec<isize>,
-) {
-    if score <= *k {
-        if *best != Some(score as usize) {
-            ends.clear();
-            *best = Some(score as usize);
-            *k = score;
+struct SemiBest<'a> {
+    k: isize,
+    distance: Option<usize>,
+    ends: Option<&'a mut Vec<isize>>,
+}
+
+impl SemiBest<'_> {
+    /// Record an admissible score. Only a score-only search can finish at zero.
+    #[inline]
+    fn report(&mut self, score: isize, end: isize) -> bool {
+        if score > self.k {
+            return false;
         }
-        ends.push(end);
+        self.distance = Some(score as usize);
+        if let Some(ends) = &mut self.ends {
+            if score < self.k {
+                ends.clear();
+            }
+            ends.push(end);
+            self.k = score;
+            false
+        } else if score == 0 {
+            true
+        } else {
+            self.k = score - 1; // Ties cannot improve a score-only result.
+            false
+        }
     }
 }
 
 fn semi_single<const FREE: bool>(
     profile: &Profile,
-    target: Sequence<'_>,
-    bound: usize,
-    ends: &mut Vec<isize>,
-) -> Option<usize> {
+    target: impl Iterator<Item = u8>,
+    best: &mut SemiBest<'_>,
+) {
     let (mut pv, mut mv, mut score) = (u64::MAX, 0, profile.len as isize);
     let high = 1 << (profile.len - 1);
-    let mut k = bound.min(profile.len) as isize;
-    let mut best = None;
-    // Preserve the fork's endpoint convention: a full word does not expose
-    // boundary zero for a nonempty target (the padded kernel has no delay).
-    if profile.len < 64 {
-        report(score, -1, &mut k, &mut best, ends);
-    }
-    for c in 0..target.len() {
-        if !FREE && c >= profile.len + k as usize {
+    for (c, symbol) in target.enumerate() {
+        if !FREE && c >= profile.len + best.k as usize {
             break;
         }
-        advance_single::<FREE>(
-            profile.row(target.at(c))[0],
-            high,
-            &mut pv,
-            &mut mv,
-            &mut score,
-        );
-        report(score, c as isize, &mut k, &mut best, ends);
+        advance_single::<FREE>(profile.row(symbol)[0], high, &mut pv, &mut mv, &mut score);
+        if best.report(score, c as isize) {
+            break;
+        }
     }
-    best
 }
 
 pub(crate) fn semiglobal(
     profile: &Profile,
-    target: Sequence<'_>,
+    target: impl Iterator<Item = u8>,
     bound: usize,
     free: bool,
-    ends: &mut Vec<isize>,
+    mut ends: Option<&mut Vec<isize>>,
+    blocks: &mut Vec<Block>,
 ) -> Option<usize> {
-    ends.clear();
-    if profile.len <= 64 {
-        return if free {
-            semi_single::<true>(profile, target, bound, ends)
-        } else {
-            semi_single::<false>(profile, target, bound, ends)
-        };
+    if let Some(ends) = &mut ends {
+        ends.clear();
     }
-    let count = profile.blocks;
-    let padding = count * 64 - profile.len;
-    let mut k = bound.min(profile.len) as isize;
-    let mut first = 0;
-    let mut end = count.min((k as usize + 1).div_ceil(64));
-    let mut blocks: Vec<Block> = (0..count)
-        .map(|b| Block::new((b as isize + 1) * 64))
-        .collect();
-    let mut best = None;
-    for c in 0..target.len() {
-        let row = profile.row(target.at(c));
-        let mut carry = Deltas {
-            p: u64::from(!free),
-            m: 0,
-        };
-        for (block, &eq) in blocks[first..end].iter_mut().zip(&row[first..end]) {
-            carry = block.advance(eq, carry, 63);
+    let mut best = SemiBest { k: bound.min(profile.len) as isize, distance: None, ends };
+    // Edlib omits boundary zero for a whole-word query and a nonempty target.
+    // That reporting convention does not exclude the empty substring as a score.
+    if profile.len % 64 != 0 || best.ends.is_none() {
+        best.report(profile.len as isize, -1);
+    }
+    if profile.len <= 64 {
+        if free {
+            semi_single::<true>(profile, target, &mut best);
+        } else {
+            semi_single::<false>(profile, target, &mut best);
         }
-        if end < count
-            && blocks[end - 1].score - carry.value() <= k
-            && (row[end] & 1 != 0 || carry.m != 0)
-        {
-            let mut block = Block::new(blocks[end - 1].score - carry.value() + 64);
-            block.advance(row[end], carry, 63);
-            blocks[end] = block;
+    } else {
+        semi_blocks(profile, target, free, &mut best, blocks);
+    }
+    best.distance
+}
+
+fn semi_blocks(
+    profile: &Profile,
+    target: impl Iterator<Item = u8>,
+    free: bool,
+    best: &mut SemiBest<'_>,
+    blocks: &mut Vec<Block>,
+) {
+    let count = profile.blocks;
+    let full = profile.len / 64;
+    let tail = profile.len % 64;
+    let width = |b| if b < full { 64 } else { tail };
+    let mut first = 0;
+    let mut end = count.min((best.k as usize + 1).div_ceil(64));
+    blocks.clear();
+    blocks.reserve_exact(count);
+    blocks.extend((1..=end).map(|b| Block::new((b * 64).min(profile.len) as isize)));
+    for (c, symbol) in target.enumerate() {
+        let k = best.k;
+        let row = profile.row(symbol);
+        let mut carry = Deltas { p: u64::from(!free), m: 0 };
+        let full_end = end.min(full);
+        let bottom = advance_words(&mut blocks[first..full_end], &row[first..full_end], &mut carry);
+        if end > full {
+            // Track the last real row: a zero is final on this column, not
+            // several columns later when it reaches the bottom of the padding.
+            blocks[full].advance(row[full], carry, tail - 1);
+        }
+        if end < count && bottom - carry.value() <= k && (row[end] & 1 != 0 || carry.m != 0) {
+            let w = width(end);
+            let mut block = Block::new(bottom - carry.value() + w as isize);
+            block.advance(row[end], carry, w - 1);
+            blocks.push(block);
             end += 1;
         } else {
             while end > first && blocks[end - 1].score >= k + 64 {
@@ -649,58 +668,53 @@ pub(crate) fn semiglobal(
             }
         }
         if c % 2048 == 0 {
-            while end > first && blocks[end - 1].all_larger(k, 64) {
+            while end > first && blocks[end - 1].all_larger(k, width(end - 1)) {
                 end -= 1;
             }
         }
-        // HW can restart at any column: its first block can never be discarded.
-        if free && end == 0 {
-            end = 1;
-        }
-        if !free {
+        if free {
+            // A match can start at the next column even if this one missed.
+            end = end.max(1);
+        } else {
             while first < end && blocks[first].score >= k + 64 {
                 first += 1;
             }
             if c % 2048 == 0 {
-                while first < end && blocks[first].all_larger(k, 64) {
+                while first < end && blocks[first].all_larger(k, width(first)) {
                     first += 1;
                 }
             }
         }
         if end <= first {
-            return best;
+            break;
         }
-        if end == count {
-            // Wildcard padding delays a final-row score by `padding` columns.
-            report(
-                blocks[end - 1].score,
-                c as isize - padding as isize,
-                &mut k,
-                &mut best,
-                ends,
-            );
+        blocks.truncate(end);
+        if end == count && best.report(blocks[end - 1].score, c as isize) {
+            break;
         }
     }
-    if end == count {
-        // Flush the delayed final endpoints from the final vertical deltas.
-        for i in 0..padding {
-            report(
-                blocks[end - 1].value(62 - i),
-                target.len() as isize - padding as isize + i as isize,
-                &mut k,
-                &mut best,
-                ends,
-            );
-        }
-    }
-    best
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EqualityPair, Profile, Sequence, Trace, distance_global, global, horizontal, trace_single,
+        EqualityPair, Profile, Sequence, Trace, distance_global, global, horizontal, semiglobal,
+        trace_single,
     };
+
+    #[test]
+    fn score_only_infix_stops_on_the_first_exact_end() {
+        let target = vec![b'a'; 1_000_000];
+        for len in [1, 64, 65, 129] {
+            let profile = Profile::new(Sequence::new(&target[..len]), &[]).unwrap();
+            for bound in [0, usize::MAX] {
+                let mut columns = 0;
+                let counted = target.iter().copied().inspect(|_| columns += 1);
+                assert_eq!(semiglobal(&profile, counted, bound, true, None, &mut Vec::new()), Some(0));
+                assert_eq!(columns, len, "query length {len}, cutoff {bound}");
+            }
+        }
+    }
 
     /// The scatter construction, kept only as the bit-plane test oracle.
     fn scatter_words(profile: &Profile, query: Sequence<'_>) -> Vec<u64> {

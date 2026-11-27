@@ -45,7 +45,8 @@ fn exhaustive_binary_inputs_all_modes_tasks_and_distance_bounds() {
 #[test]
 fn score_only_distances_match_scalar_dp() {
     use rust_edlib::{
-        distance, prefix_distance, prefix_distance_at_most, suffix_distance, suffix_distance_at_most,
+        distance, distance_at_most, infix_distance, infix_distance_at_most, prefix_distance,
+        prefix_distance_at_most, suffix_distance, suffix_distance_at_most,
     };
     let check = |q: &[u8], t: &[u8]| {
         let reverse = |s: &[u8]| s.iter().rev().copied().collect::<Vec<_>>();
@@ -53,12 +54,19 @@ fn score_only_distances_match_scalar_dp() {
         let global = quadratic(q, t, AlignmentMode::Global, &[]).distance;
         assert_eq!(distance(q, t), Ok(global));
         assert_eq!(distance(t, q), Ok(global));
+        for k in limits(global).into_iter().flatten() {
+            let expected = Ok((global <= k).then_some(global));
+            assert_eq!(distance_at_most(q, t, k), expected);
+            assert_eq!(distance_at_most(t, q, k), expected);
+        }
         let prefix = oracle(q, t);
         let suffix = oracle(&reverse(q), &reverse(t));
+        let infix = quadratic(q, t, AlignmentMode::Infix, &[]).distance;
         assert_eq!(prefix_distance(q, t), Ok(prefix));
         assert_eq!(suffix_distance(q, t), Ok(suffix));
-        let scorers = [prefix_distance_at_most, suffix_distance_at_most];
-        for (score, d) in scorers.into_iter().zip([prefix, suffix]) {
+        assert_eq!(infix_distance(q, t), Ok(infix));
+        let scorers = [prefix_distance_at_most, suffix_distance_at_most, infix_distance_at_most];
+        for (score, d) in scorers.into_iter().zip([prefix, suffix, infix]) {
             for k in limits(d).into_iter().flatten() {
                 assert_eq!(score(q, t, k), Ok((d <= k).then_some(d)));
             }
@@ -70,6 +78,11 @@ fn score_only_distances_match_scalar_dp() {
             check(a, b);
         }
     }
+    check(b"ab", b"ax---ab"); // A cutoff hit before the exact match is not final.
+    let mut late = vec![b'x'; 2049];
+    late[..64].fill(b'a');
+    late.extend([b'a'; 65]);
+    check(&[b'a'; 65], &late); // Restart a multiword match after strong pruning.
     let mut rng = Rng::new(SEED);
     for n in BOUNDARY_LENGTHS {
         let query = rng.bytes(n);
@@ -88,6 +101,38 @@ fn score_only_distances_match_scalar_dp() {
     *target.last_mut().unwrap() ^= 1;
     check(&query, &target);
     check(&target, &query);
+}
+
+#[test]
+fn unbounded_infix_recovers_an_early_optimum_after_a_narrow_band_miss() {
+    use rust_edlib::{infix_distance, infix_distance_at_most};
+
+    let query = [b'a'; 257];
+    let mut target = vec![b'a'; 160];
+    target.extend([b'x'; 257]);
+    target.extend([b'a'; 145]);
+    // The first run costs 97 deletions, the last costs 112. A wider pass
+    // must reconsider the first run, not resume at the end of the target.
+    assert_eq!(infix_distance(&query, &target), Ok(97));
+    assert_eq!(infix_distance_at_most(&query, &target, usize::MAX), Ok(Some(97)));
+    assert_eq!(infix_distance_at_most(&query, &target, 96), Ok(None));
+
+    let disjoint = [b'x'; 300];
+    assert_eq!(infix_distance(&query, &disjoint), Ok(query.len()));
+    assert_eq!(infix_distance_at_most(&query, &disjoint, query.len() - 1), Ok(None));
+}
+
+#[test]
+fn infix_distance_task_reports_every_tied_end() {
+    let target = vec![b'a'; 1_000_000];
+    let config = AlignConfig {
+        mode: AlignmentMode::Infix,
+        task: AlignmentTask::Distance,
+        ..Default::default()
+    };
+    let result = align(b"a", &target, &config).unwrap();
+    assert_eq!(result.edit_distance(), Some(0));
+    assert!(result.end_offsets().eq(1..=target.len()));
 }
 
 #[test]

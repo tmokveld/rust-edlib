@@ -99,20 +99,27 @@ fn unbounded_distance(upper: usize, mut search: impl FnMut(usize) -> Option<usiz
     }
 }
 
+fn checked_shorter_first<'a>(
+    query: &'a [u8],
+    target: &'a [u8],
+) -> Result<(&'a [u8], &'a [u8]), AlignError> {
+    check_lengths(query.len(), target.len())?;
+    Ok(if query.len() <= target.len() {
+        (query, target)
+    } else {
+        (target, query)
+    })
+}
+
 /// Exact global Levenshtein distance between two byte slices, without a bound.
 /// Computes only the score, not locations or an edit path.
 ///
 /// ```
-/// assert_eq!(rust_edlib::distance(b"kitten", b"sitting")?, 3);
+/// assert_eq!(rust_edlib::distance(b"ACGT", b"AGGGA")?, 3);
 /// # Ok::<(), rust_edlib::AlignError>(())
 /// ```
 pub fn distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
-    let (short, long) = if query.len() <= target.len() {
-        (query, target)
-    } else {
-        (target, query)
-    };
-    check_lengths(short.len(), long.len())?;
+    let (short, long) = checked_shorter_first(query, target)?;
     if short.is_empty() {
         return Ok(long.len());
     }
@@ -130,6 +137,38 @@ pub fn distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
         }
         slack *= 2;
     }
+}
+
+/// Exact global [`distance`] up to the inclusive cutoff `k`, without collecting
+/// locations or an edit path. Returns `Ok(None)` if the distance exceeds `k`.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
+/// cannot be accommodated.
+///
+/// ```
+/// use rust_edlib::distance_at_most;
+///
+/// assert_eq!(distance_at_most(b"ACGT", b"AGGGA", 3)?, Some(3));
+/// assert_eq!(distance_at_most(b"ACGT", b"AGGGA", 2)?, None);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn distance_at_most(
+    query: &[u8],
+    target: &[u8],
+    k: usize,
+) -> Result<Option<usize>, AlignError> {
+    let (short, long) = checked_shorter_first(query, target)?;
+    if long.len() - short.len() > k {
+        return Ok(None);
+    }
+    if short.is_empty() {
+        return Ok(Some(long.len()));
+    }
+    // No global score exceeds long.len(), but k itself need not fit in isize.
+    let k = k.min(long.len());
+    let profile = Profile::new(Sequence::new(short), &[])?;
+    Ok(kernel::distance_global(&profile, Sequence::new(long), k))
 }
 
 /// Exact Levenshtein distance from the entire `query` to the best prefix of
@@ -158,7 +197,7 @@ pub fn prefix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError>
 /// cannot be accommodated.
 ///
 /// ```
-/// assert_eq!(rust_edlib::prefix_distance_at_most(b"cat", b"cutlass", 1)?, Some(1));
+/// assert_eq!(rust_edlib::prefix_distance_at_most(b"ACG", b"ATGCA", 1)?, Some(1));
 /// # Ok::<(), rust_edlib::AlignError>(())
 /// ```
 pub fn prefix_distance_at_most(
@@ -192,7 +231,7 @@ pub fn suffix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError>
 /// cannot be accommodated.
 ///
 /// ```
-/// assert_eq!(rust_edlib::suffix_distance_at_most(b"cat", b"shortcut", 0)?, None);
+/// assert_eq!(rust_edlib::suffix_distance_at_most(b"ACG", b"TTATG", 0)?, None);
 /// # Ok::<(), rust_edlib::AlignError>(())
 /// ```
 pub fn suffix_distance_at_most(
@@ -235,8 +274,81 @@ fn anchored_distance<const REVERSE: bool>(
     myers::distance::<REVERSE>(query, target, m.saturating_sub(extent).max(1), limit)
 }
 
+/// Minimum Levenshtein distance from the entire `query` to any contiguous
+/// substring of `target`, including the empty substring. Both target flanks
+/// are free; bytes match only when equal.
+///
+/// Unlike [`align`] with [`AlignmentTask::Distance`], this search does not
+/// collect endpoints. It stops at the first exact match.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
+/// cannot be accommodated.
+///
+/// ```
+/// assert_eq!(rust_edlib::infix_distance(b"AC", b"TACGAC")?, 0);
+/// assert_eq!(rust_edlib::infix_distance(b"AC", b"")?, 2);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn infix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
+    Ok(infix_distance_at_most(query, target, query.len())?
+        .expect("the empty substring is within the query-length bound"))
+}
+
+/// Exact [`infix_distance`] up to the inclusive cutoff `k`. Returns `Ok(Some(d))`
+/// for the minimum score `d` if it is within the cutoff, or `Ok(None)` otherwise.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
+/// cannot be accommodated.
+///
+/// ```
+/// use rust_edlib::infix_distance_at_most;
+///
+/// assert_eq!(infix_distance_at_most(b"ab", b"ax---ab", 1)?, Some(0));
+/// assert_eq!(infix_distance_at_most(b"ab", b"ax", 0)?, None);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn infix_distance_at_most(
+    query: &[u8],
+    target: &[u8],
+    k: usize,
+) -> Result<Option<usize>, AlignError> {
+    let (m, n) = (query.len(), target.len());
+    check_lengths(m, n)?;
+    let gap = m.saturating_sub(n);
+    if gap > k {
+        return Ok(None);
+    }
+    if m == 0 || n == 0 {
+        return Ok(Some(m));
+    }
+    let profile = Profile::new(Sequence::new(query), &[])?;
+    let empty = (k >= m).then_some(m);
+    let limit = k.min(m - 1); // Only search for scores better than the empty substring.
+    let mut bound = if empty.is_some() {
+        (gap + 64).min(limit)
+    } else {
+        limit
+    };
+    let mut blocks = Vec::new();
+    loop {
+        let score = kernel::semiglobal(
+            &profile, target.iter().copied(), bound, true, None, &mut blocks,
+        );
+        if score.is_some() || bound == limit {
+            return Ok(score.or(empty));
+        }
+        // A narrow miss rules out this budget, not a match. Replay from column zero.
+        bound = bound.saturating_mul(2).min(limit);
+    }
+}
+
 /// Align arbitrary bytes without copying the inputs. The result borrows neither
 /// inputs nor configuration. A bound exceeded is `Ok` with distance `None`.
+///
+/// Even [`AlignmentTask::Distance`] collects optimal ends. For an infix score
+/// alone with ordinary byte equality, use [`infix_distance`] or [`infix_distance_at_most`].
 ///
 /// End locations are inclusive for binding compatibility; prefer `locations()`
 /// and `end_offsets()`. In particular, inclusive end `-1` maps to offset zero.
@@ -314,16 +426,18 @@ pub fn align(
     }
 
     let profile = Profile::new(Sequence::new(query), config.additional_equalities)?;
+    let mut blocks = Vec::new();
     let mut search = |k| {
         if config.mode == AlignmentMode::Global {
             kernel::distance_global(&profile, Sequence::new(target), k)
         } else {
             kernel::semiglobal(
                 &profile,
-                Sequence::new(target),
+                target.iter().copied(),
                 k,
                 config.mode == AlignmentMode::Infix,
-                &mut result.ends,
+                Some(&mut result.ends),
+                &mut blocks,
             )
         }
     };
@@ -350,10 +464,11 @@ pub fn align(
                 }
                 let score = kernel::semiglobal(
                     &reverse,
-                    Sequence::reversed(&target[..offset]),
+                    target[..offset].iter().rev().copied(),
                     distance,
                     false,
-                    &mut reverse_ends,
+                    Some(&mut reverse_ends),
+                    &mut blocks,
                 );
                 debug_assert_eq!(score, Some(distance));
                 // Last reverse endpoint selects the earliest optimal start.
@@ -366,6 +481,7 @@ pub fn align(
         result.starts = Some(starts);
     }
     if config.task == AlignmentTask::Path {
+        drop(blocks); // The search band is not needed for path reconstruction.
         let start = result.starts.as_ref().unwrap()[0];
         let end = (result.ends[0] + 1) as usize;
         // The forward profile depends only on the query and equalities. The

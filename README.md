@@ -13,14 +13,15 @@ cargo add rust-edlib
 ## Examples
 
 Each distance function scores the whole query. `rust_edlib::distance(query, target)`
-compares it with the whole target. Use `prefix_distance` for the minimum edit
-distance to any target prefix, or `suffix_distance` for the minimum distance
-to any target suffix. All three return `Result<usize, AlignError>` without
-collecting locations or building an edit path. The suffix search reads the
-slices backwards without copying them.
+compares it with the whole target. `prefix_distance` and `suffix_distance`
+minimize over target prefixes and suffixes, respectively. `infix_distance`
+minimizes over all contiguous target substrings, including the empty one.
+All four return `Result<usize, AlignError>` without collecting locations or
+building an edit path. The suffix search reads the slices backwards without
+copying them.
 
 ```rust
-use rust_edlib::{AlignError, distance, prefix_distance, suffix_distance};
+use rust_edlib::{AlignError, distance, infix_distance, prefix_distance, suffix_distance};
 
 fn main() -> Result<(), AlignError> {
     let target = b"CAGCAA";
@@ -28,16 +29,29 @@ fn main() -> Result<(), AlignError> {
     assert_eq!(prefix_distance(b"CAG", target)?, 0);
     assert_eq!(suffix_distance(b"CAA", target)?, 0);
     assert_eq!(suffix_distance(b"CAG", target)?, 1); // Closest suffix: CAA.
+    assert_eq!(infix_distance(b"AGC", target)?, 0);
     Ok(())
 }
 ```
 
-For score-only searches with an inclusive cutoff `k`, `prefix_distance_at_most`
-and `suffix_distance_at_most` return `Ok(Some(d))` for the exact best score
-at or below `k`, or `Ok(None)` if every flank (including the empty one) costs
-more. A sizing or allocation failure is an error, not a cutoff miss.
+For score-only searches with an inclusive cutoff `k`, use `distance_at_most`,
+`prefix_distance_at_most`, `suffix_distance_at_most`, or `infix_distance_at_most`.
+Each returns `Ok(Some(d))` when its minimum score `d` is at most `k`, or `Ok(None)`
+otherwise. A sizing error returns `Err(AlignError::InputTooLong)`, not a cutoff miss.
 
-Use `align` for a bounded global alignment, an infix match, locations, or an edit path:
+```rust
+use rust_edlib::{AlignError, distance_at_most};
+
+fn main() -> Result<(), AlignError> {
+    assert_eq!(distance_at_most(b"ACGT", b"AGGGA", 3)?, Some(3));
+    assert_eq!(distance_at_most(b"ACGT", b"AGGGA", 2)?, None);
+    Ok(())
+}
+```
+
+Use `align` for optimal ends, custom byte equalities, or an edit path. Even with
+`AlignmentTask::Distance`, infix `align` collects all reported optimal ends.
+`infix_distance` needs only the score and stops at the first exact match.
 
 ```rust
 use rust_edlib::{AlignConfig, AlignError, AlignmentMode, AlignmentTask, CigarFormat, align};
@@ -85,7 +99,7 @@ All 256 byte values are valid, including NUL and bytes that are not valid UTF-8.
 Pass a slice of `EqualityPair` values as `additional_equalities` to treat
 different bytes as matches. For example, `EqualityPair::new(b'A', b'a')`
 adds equality in both directions. Every byte equals itself; pairs are not
-transitive, so adding `A = B` and `B = C` does not add `A = C`.
+transitive, so adding `A = G` and `G = C` does not add `A = C`.
 
 ## Spans, paths, and CIGAR
 
@@ -104,53 +118,16 @@ flanks. The result owns its buffers and is `Send + Sync`; accessors borrow
 without copying, and `cigar()` returns a formatter that writes directly to
 its destination.
 
-## API notes and edge cases
-
-- The API borrows its configuration, uses `usize` for distances and offsets,
-  and uses `isize` for inclusive ends. It does not interpret Unicode or
-  support affine gap penalties.
-- In `Prefix` and `Infix` modes, a nonempty target and a query length that is
-  a positive multiple of 64 suppress the end at target offset zero, even if
-  it is optimal. This affects reported locations for every task, not the
-  edit distance.
-- Empty inputs still honor the task and bound. An empty global query deletes the
-  entire target, an empty prefix query matches only `0..0`, and an empty infix
-  query matches every boundary. An empty target consumes the query with
-  insertions. A computed empty path is `Some(&[])` and formats as an empty
-  CIGAR, rather than returning `None`.
-- Paths are deterministic. Backward traceback tries `Insert`, then `Delete`,
-  then a diagonal step. Hirschberg tries interior split rows in increasing
-  order before the boundary rows. Different trace memory thresholds can
-  lead to different, equally optimal paths; identical CIGAR across
-  implementations is not guaranteed.
-
 ## Algorithm and memory
 
-The distance kernel uses Myers bit vectors with Ukkonen band pruning. Global
-and anchored score searches can advance two adjacent 64-row blocks with one
-`u128` addition, retaining the score of each block. A partial anchored block
-tracks its last real row.
+The distance functions use banded Myers bit vectors. Score-only searches need
+at most linear space in the query length and store no locations. For infix
+search, the first exact match settles the score; `align` keeps scanning for
+tied ends.
 
-The unbounded score-only functions grow the budget above the mandatory length gap. An
-anchored miss also uses the query extent of the failed band to choose the
-next budget. This is a prediction, not a bound: every wider pass restarts
-from column zero. `align` with no explicit bound retains its doubling search.
-For a cutoff smaller than the cost of deleting the remaining query, the
-multiword anchored scorer uses a single band at that cutoff.
-Inputs are borrowed, even in reverse. Infix start recovery runs a reverse
-prefix search per reported end, so many ties can make `Locations` and `Path`
-more expensive than `Distance`.
-
-Path reconstruction starts from the query profile built for the distance search.
-Short path problems keep packed traceback columns. Once the optimal distance is
-known, a single-word band cannot lose its only word, so queries of up to 64
-bytes record their columns without band updates. Traceback tests insertion
-steps directly from the stored vertical deltas and shares score decoding between
-neighboring cells. Larger problems use banded Hirschberg reconstruction and
-release split workspace before recursing.
-Working memory is linear in the query length apart from a bounded trace buffer
-and the recursion stack. Returned locations and edit operations take additional
-space proportional to their respective output sizes.
+`align` also needs space for the locations and edit operations it returns.
+For long alignments, it reconstructs the path with Hirschberg's algorithm
+instead of storing the full alignment matrix.
 
 ## Build, test, and docs
 
@@ -180,9 +157,6 @@ git clone --depth 1 --branch python-1.3.9 \
 EDLIB_SOURCE="$PWD/target/edlib-upstream" \
   cargo run --locked --release --manifest-path tools/edlib-bench/Cargo.toml
 ```
-
-The benchmark is a separate Cargo workspace; it adds no native dependency to
-the library.
 
 ## License and references
 
