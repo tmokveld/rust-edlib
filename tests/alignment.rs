@@ -49,8 +49,6 @@ fn score_only_distances_match_scalar_dp() {
         prefix_distance_at_most, suffix_distance, suffix_distance_at_most,
     };
     let check = |q: &[u8], t: &[u8]| {
-        let reverse = |s: &[u8]| s.iter().rev().copied().collect::<Vec<_>>();
-        let oracle = |a: &[u8], b: &[u8]| quadratic(a, b, AlignmentMode::Prefix, &[]).distance;
         let global = quadratic(q, t, AlignmentMode::Global, &[]).distance;
         assert_eq!(distance(q, t), Ok(global));
         assert_eq!(distance(t, q), Ok(global));
@@ -59,8 +57,8 @@ fn score_only_distances_match_scalar_dp() {
             assert_eq!(distance_at_most(q, t, k), expected);
             assert_eq!(distance_at_most(t, q, k), expected);
         }
-        let prefix = oracle(q, t);
-        let suffix = oracle(&reverse(q), &reverse(t));
+        let prefix = quadratic(q, t, AlignmentMode::Prefix, &[]).distance;
+        let suffix = quadratic(q, t, AlignmentMode::Suffix, &[]).distance;
         let infix = quadratic(q, t, AlignmentMode::Infix, &[]).distance;
         assert_eq!(prefix_distance(q, t), Ok(prefix));
         assert_eq!(suffix_distance(q, t), Ok(suffix));
@@ -377,6 +375,40 @@ fn starts_choose_earliest_optimum_and_path_covers_only_first_span() {
 }
 
 #[test]
+fn suffix_uses_the_longest_tied_span_at_the_cutoff_after_a_long_free_flank() {
+    let flank = 1 << 20;
+    let mut target = vec![b'!'; flank];
+    // BC, XBC and aXBC all cost one edit, but only the longest uses a target deletion.
+    target.extend_from_slice(b"aXBC");
+    let pairs = [EqualityPair::new(b'A', b'a')];
+    for (query, distance, start) in [(b"ABC".as_slice(), 1, flank), (b"", 0, target.len())] {
+        let expected = Expected {
+            distance,
+            ends: vec![target.len() as isize - 1],
+            starts: vec![start],
+        };
+        for task in TASKS {
+            for max_distance in limits(distance) {
+                let config = AlignConfig {
+                    mode: AlignmentMode::Suffix,
+                    task,
+                    max_distance,
+                    additional_equalities: &pairs,
+                };
+                let result = align(query, &target, &config).unwrap();
+                assert_snapshot(
+                    query,
+                    &target,
+                    &config,
+                    &expected,
+                    &Snapshot::capture(&result),
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn cigar_literals_preserve_orientation_and_merge_standard_diagonals() {
     for (query, target, extended, standard) in [
         (b"ACGT".as_slice(), b"AGGT".as_slice(), "1=1X2=", "4M"),
@@ -456,6 +488,55 @@ fn adaptive_distance_and_strong_band_transitions_have_closed_form_answers() {
     target.extend_from_slice(&query);
     target.extend([253; 67]);
     exercise(&query, &target, &[]);
+}
+
+#[test]
+fn global_tied_deletions_keep_the_selected_forward_paths() {
+    use EditOperation::{Delete, Match};
+
+    for (query_len, target_len, matches_before_deletions) in [
+        (1_617, 1_618, 1_617), // Whole traceback prefers a deletion over a diagonal.
+        (1_617, 2_049, 592),   // The root split puts deletions in the left half.
+        (4_094, 4_097, 1_021), // An ambiguous descendant still needs its local split.
+    ] {
+        let query = vec![b'A'; query_len];
+        let target = vec![b'A'; target_len];
+        let distance = target_len - query.len();
+        let result = align(
+            &query,
+            &target,
+            &AlignConfig {
+                task: AlignmentTask::Path,
+                max_distance: Some(distance),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut expected = vec![Match; target_len];
+        expected[matches_before_deletions..matches_before_deletions + distance].fill(Delete);
+        assert_eq!(result.edit_distance(), Some(distance));
+        assert_eq!(result.path(), Some(expected.as_slice()), "target_len={target_len}");
+    }
+}
+
+#[test]
+fn exhausted_global_history_still_returns_the_inclusive_hit() {
+    // The large mandatory gap keeps almost all 16,384 blocks active. Three
+    // checkpoints cannot coexist in 1 MiB, but this score is attainable.
+    let query = vec![b'A'; 1 << 20];
+    let target = [b'A'; 64];
+    let distance = query.len() - target.len();
+    let config = AlignConfig {
+        task: AlignmentTask::Path,
+        max_distance: Some(distance),
+        ..Default::default()
+    };
+    let hit = align(&query, &target, &config).unwrap();
+    assert_eq!(hit.edit_distance(), Some(distance));
+    let path = hit.path().unwrap();
+    assert_eq!(&path[..target.len()], &[EditOperation::Match; 64]);
+    assert_eq!(path.len(), query.len());
+    assert!(path[target.len()..].iter().all(|&op| op == EditOperation::Insert));
 }
 
 #[test]

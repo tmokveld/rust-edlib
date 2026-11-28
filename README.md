@@ -17,8 +17,7 @@ compares it with the whole target. `prefix_distance` and `suffix_distance`
 minimize over target prefixes and suffixes, respectively. `infix_distance`
 minimizes over all contiguous target substrings, including the empty one.
 All four return `Result<usize, AlignError>` without collecting locations or
-building an edit path. The suffix search reads the slices backwards without
-copying them.
+building an edit path.
 
 ```rust
 use rust_edlib::{AlignError, distance, infix_distance, prefix_distance, suffix_distance};
@@ -38,13 +37,28 @@ For score-only searches with an inclusive cutoff `k`, use `distance_at_most`,
 `prefix_distance_at_most`, `suffix_distance_at_most`, or `infix_distance_at_most`.
 Each returns `Ok(Some(d))` when its minimum score `d` is at most `k`, or `Ok(None)`
 otherwise. A sizing error returns `Err(AlignError::InputTooLong)`, not a cutoff miss.
+If you have an estimate rather than a cutoff, `distance_with_hint(query, target, hint)`
+returns the exact global score even when `hint` is too small.
 
 ```rust
-use rust_edlib::{AlignError, distance_at_most};
+use rust_edlib::{
+    AlignError, distance_at_most, infix_distance_at_most, prefix_distance_at_most,
+    suffix_distance_at_most,
+};
 
 fn main() -> Result<(), AlignError> {
     assert_eq!(distance_at_most(b"ACGT", b"AGGGA", 3)?, Some(3));
     assert_eq!(distance_at_most(b"ACGT", b"AGGGA", 2)?, None);
+
+    // ATG is one edit from ACG; each mode ignores a different target flank.
+    assert_eq!(prefix_distance_at_most(b"ACG", b"ATGTT", 1)?, Some(1));
+    assert_eq!(prefix_distance_at_most(b"ACG", b"ATGTT", 0)?, None);
+
+    assert_eq!(suffix_distance_at_most(b"ACG", b"TTATG", 1)?, Some(1));
+    assert_eq!(suffix_distance_at_most(b"ACG", b"TTATG", 0)?, None);
+
+    assert_eq!(infix_distance_at_most(b"ACG", b"TTATGTT", 1)?, Some(1));
+    assert_eq!(infix_distance_at_most(b"ACG", b"TTATGTT", 0)?, None);
     Ok(())
 }
 ```
@@ -72,6 +86,20 @@ fn main() -> Result<(), AlignError> {
 }
 ```
 
+Use `align_runs` when you need one optimal target range and a coalesced path,
+not every tied location or a byte per operation:
+
+```rust
+use rust_edlib::{AlignError, AlignmentMode, EditOperation, Run, align_runs};
+
+fn main() -> Result<(), AlignError> {
+    let hit = align_runs(b"TAG", b"xxTAG", AlignmentMode::Suffix, Some(0), &[])?.unwrap();
+    assert_eq!(hit.target, 2..5);
+    assert_eq!(hit.runs, [Run { op: EditOperation::Match, len: 3 }]);
+    Ok(())
+}
+```
+
 ## Modes, tasks, and options
 
 Every mode consumes the entire query:
@@ -80,6 +108,7 @@ Every mode consumes the entire query:
 |---|---|
 | `Global` (NW) | The entire target |
 | `Prefix` (SHW) | A prefix; the trailing flank is free |
+| `Suffix` (Reverse SHW) | A suffix; the leading flank is free |
 | `Infix` (HW) | A substring; both flanks are free |
 
 | Task | Result on a match |
@@ -109,7 +138,6 @@ end offsets even with the `Distance` task. For Edlib compatibility,
 `end_locations()` yields inclusive ends, where `-1` means end offset zero.
 Global and prefix spans start at zero. For each reported infix end,
 `locations()` uses the earliest optimal start.
-
 `path()` covers only the first reported span. `Insert` consumes a query byte,
 `Delete` consumes a target byte, and `Match` and `Mismatch` consume one byte
 from each. Extended CIGAR uses `=`, `X`, `I`, and `D`; standard CIGAR merges
@@ -117,17 +145,6 @@ adjacent matches and mismatches into `M` runs. Neither includes free target
 flanks. The result owns its buffers and is `Send + Sync`; accessors borrow
 without copying, and `cigar()` returns a formatter that writes directly to
 its destination.
-
-## Algorithm and memory
-
-The distance functions use banded Myers bit vectors. Score-only searches need
-at most linear space in the query length and store no locations. For infix
-search, the first exact match settles the score; `align` keeps scanning for
-tied ends.
-
-`align` also needs space for the locations and edit operations it returns.
-For long alignments, it reconstructs the path with Hirschberg's algorithm
-instead of storing the full alignment matrix.
 
 ## Build, test, and docs
 
@@ -143,20 +160,12 @@ CC=false CXX=false cargo doc --locked --no-deps
 
 Open `target/doc/rust_edlib/index.html` to browse the generated API docs.
 
-## CI and upstream benchmark
+## CI and benchmarks
 
 [GitHub Actions](.github/workflows/ci.yml) tests debug and release builds on Rust
-1.85 with the C and C++ compilers disabled. A separate release job compares
-against [Martin Šošić's Edlib 1.3.9](https://github.com/Martinsos/edlib/tree/f8afceb49ab0095c852e0b8b488ae2c88e566afd).
+1.85 with the C and C++ compilers disabled.
 
-To run the comparison locally with a C++ compiler:
-
-```sh
-git clone --depth 1 --branch python-1.3.9 \
-  https://github.com/Martinsos/edlib.git target/edlib-upstream
-EDLIB_SOURCE="$PWD/target/edlib-upstream" \
-  cargo run --locked --release --manifest-path tools/edlib-bench/Cargo.toml
-```
+See the [benchmark guide](tools/edlib-bench/README.md) to compare performance.
 
 ## License and references
 

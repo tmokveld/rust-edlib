@@ -6,10 +6,11 @@ use rust_edlib::aligner::{
 use std::ops::Range;
 
 pub const SEED: u64 = 0x5eed_ed1b_4285_fee6;
-pub const MODES: [AlignmentMode; 3] = [
+pub const MODES: [AlignmentMode; 4] = [
     AlignmentMode::Global,
     AlignmentMode::Prefix,
     AlignmentMode::Infix,
+    AlignmentMode::Suffix,
 ];
 pub const TASKS: [AlignmentTask; 3] = [
     AlignmentTask::Distance,
@@ -41,9 +42,10 @@ pub fn quadratic(
     mode: AlignmentMode,
     pairs: &[EqualityPair],
 ) -> Expected {
-    let infix = mode == AlignmentMode::Infix;
+    let free_start = matches!(mode, AlignmentMode::Infix | AlignmentMode::Suffix);
+    let fixed_end = matches!(mode, AlignmentMode::Global | AlignmentMode::Suffix);
     let mut row: Vec<(usize, usize)> = (0..=target.len())
-        .map(|j| if infix { (0, j) } else { (j, 0) })
+        .map(|j| if free_start { (0, j) } else { (j, 0) })
         .collect();
     for (i, &q) in query.iter().enumerate() {
         let mut diagonal = row[0];
@@ -56,12 +58,12 @@ pub fn quadratic(
             diagonal = above;
         }
     }
-    let distance = if mode == AlignmentMode::Global {
+    let distance = if fixed_end {
         row[target.len()].0
     } else {
         row.iter().map(|cell| cell.0).min().unwrap()
     };
-    let offsets: Vec<usize> = if mode == AlignmentMode::Global {
+    let offsets: Vec<usize> = if fixed_end {
         vec![target.len()]
     } else {
         row.iter()

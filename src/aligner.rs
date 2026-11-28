@@ -4,6 +4,10 @@ use crate::kernel::{self, Profile, Sequence};
 use crate::myers;
 use std::{fmt, ops::Range};
 
+mod global;
+mod infix;
+pub use global::GlobalProbe;
+
 /// Which target gaps are free.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AlignmentMode {
@@ -14,12 +18,15 @@ pub enum AlignmentMode {
     Prefix,
     /// Align the query anywhere in the target; both target flanks are free (HW).
     Infix,
+    /// Align the query to a target suffix; leading target gaps are free.
+    /// The only end is the target length, and ties choose the earliest start.
+    Suffix,
 }
 
 /// More detailed tasks require more computation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AlignmentTask {
-    /// Compute distance and every reference-reported optimal end location.
+    /// Compute distance and every reported optimal end location.
     #[default]
     Distance,
     /// Also compute the corresponding start locations.
@@ -88,27 +95,20 @@ fn check_lengths(m: usize, n: usize) -> Result<(), AlignError> {
     Ok(())
 }
 
-fn unbounded_distance(upper: usize, mut search: impl FnMut(usize) -> Option<usize>) -> usize {
+pub(crate) fn search_distance(
+    upper: usize, limit: Option<usize>, mut search: impl FnMut(usize) -> Option<usize>,
+) -> Option<usize> {
+    if let Some(k) = limit {
+        return search(k);
+    }
     let mut k = 64.min(upper);
     loop {
         if let Some(distance) = search(k) {
-            return distance;
+            return Some(distance);
         }
         // `upper` is a feasible edit distance, so the search succeeds by then.
         k = k.saturating_mul(2).min(upper);
     }
-}
-
-fn checked_shorter_first<'a>(
-    query: &'a [u8],
-    target: &'a [u8],
-) -> Result<(&'a [u8], &'a [u8]), AlignError> {
-    check_lengths(query.len(), target.len())?;
-    Ok(if query.len() <= target.len() {
-        (query, target)
-    } else {
-        (target, query)
-    })
 }
 
 /// Exact global Levenshtein distance between two byte slices, without a bound.
@@ -119,24 +119,25 @@ fn checked_shorter_first<'a>(
 /// # Ok::<(), rust_edlib::AlignError>(())
 /// ```
 pub fn distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> {
-    let (short, long) = checked_shorter_first(query, target)?;
-    if short.is_empty() {
-        return Ok(long.len());
-    }
-    let profile = Profile::new(Sequence::new(short), &[])?;
-    let target = Sequence::new(long);
-    // The mandatory insertions are not an estimate of divergence. Grow
-    // the allowance for edits *in excess* of the length difference instead
-    // of rounding the entire distance up to the next power of two.
-    let gap = long.len() - short.len();
-    let mut slack = kernel::initial_slack(gap, short.len());
-    loop {
-        let k = gap + slack.min(short.len());
-        if let Some(d) = kernel::distance_global(&profile, target, k) {
-            return Ok(d);
-        }
-        slack *= 2;
-    }
+    global::distance(query, target, None)
+}
+
+/// Exact global [`distance`] using an initial estimate of the total edit
+/// distance, including the mandatory length difference. The hint is not a
+/// cutoff: if a narrow search misses, the search widens until it finds the
+/// exact score. Hints outside the feasible score range are clamped.
+/// Computes only the score, not locations or an edit path.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
+/// cannot be accommodated.
+///
+/// ```
+/// assert_eq!(rust_edlib::distance_with_hint(b"ACGT", b"AGGGA", 1)?, 3);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn distance_with_hint(query: &[u8], target: &[u8], hint: usize) -> Result<usize, AlignError> {
+    global::distance(query, target, Some(hint))
 }
 
 /// Exact global [`distance`] up to the inclusive cutoff `k`, without collecting
@@ -158,17 +159,7 @@ pub fn distance_at_most(
     target: &[u8],
     k: usize,
 ) -> Result<Option<usize>, AlignError> {
-    let (short, long) = checked_shorter_first(query, target)?;
-    if long.len() - short.len() > k {
-        return Ok(None);
-    }
-    if short.is_empty() {
-        return Ok(Some(long.len()));
-    }
-    // No global score exceeds long.len(), but k itself need not fit in isize.
-    let k = k.min(long.len());
-    let profile = Profile::new(Sequence::new(short), &[])?;
-    Ok(kernel::distance_global(&profile, Sequence::new(long), k))
+    global::distance_at_most(query, target, k)
 }
 
 /// Exact Levenshtein distance from the entire `query` to the best prefix of
@@ -297,6 +288,7 @@ pub fn infix_distance(query: &[u8], target: &[u8]) -> Result<usize, AlignError> 
 
 /// Exact [`infix_distance`] up to the inclusive cutoff `k`. Returns `Ok(Some(d))`
 /// for the minimum score `d` if it is within the cutoff, or `Ok(None)` otherwise.
+/// A zero cutoff searches for an exact byte substring without building a Myers profile.
 ///
 /// # Errors
 /// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
@@ -322,6 +314,9 @@ pub fn infix_distance_at_most(
     }
     if m == 0 || n == 0 {
         return Ok(Some(m));
+    }
+    if k == 0 {
+        return Ok(infix::find_exact(query, target)?.map(|_| 0));
     }
     let profile = Profile::new(Sequence::new(query), &[])?;
     let empty = (k >= m).then_some(m);
@@ -350,6 +345,10 @@ pub fn infix_distance_at_most(
 /// Even [`AlignmentTask::Distance`] collects optimal ends. For an infix score
 /// alone with ordinary byte equality, use [`infix_distance`] or [`infix_distance_at_most`].
 ///
+/// [`AlignmentMode::Suffix`] reports only the end of `target`. Locations and
+/// paths use the longest optimal suffix, in the original target coordinates.
+/// An empty query uses the empty span at the end of `target`.
+///
 /// End locations are inclusive for binding compatibility; prefer `locations()`
 /// and `end_offsets()`. In particular, inclusive end `-1` maps to offset zero.
 ///
@@ -368,14 +367,21 @@ pub fn align(
     config: &AlignConfig<'_>,
 ) -> Result<Alignment, AlignError> {
     let (m, n) = (query.len(), target.len());
-    check_lengths(m, n)?;
-    kernel::check_buffer::<isize>(n.checked_add(1).ok_or(AlignError::InputTooLong)?)?;
+    let suffix = config.mode == AlignmentMode::Suffix;
     let upper = if config.mode == AlignmentMode::Global {
         m.max(n)
     } else {
         m
     };
     let limit = config.max_distance.map(|k| k.min(upper));
+    if suffix {
+        // Longer suffixes cannot meet the cutoff on length difference alone.
+        let extent = n.min(m.saturating_add(limit.unwrap_or(upper)));
+        check_lengths(m, extent)?;
+    } else {
+        check_lengths(m, n)?;
+        kernel::check_buffer::<isize>(n.checked_add(1).ok_or(AlignError::InputTooLong)?)?;
+    }
     let mut result = Alignment {
         distance: None,
         ends: Vec::new(),
@@ -391,7 +397,7 @@ pub fn align(
         if empty_infix {
             result.ends = (0..=n).map(|i| i as isize - 1).collect();
         } else {
-            result.ends.push(if config.mode == AlignmentMode::Global {
+            result.ends.push(if suffix || config.mode == AlignmentMode::Global {
                 n as isize - 1
             } else {
                 -1
@@ -400,6 +406,8 @@ pub fn align(
         if config.task != AlignmentTask::Distance {
             result.starts = Some(if empty_infix {
                 (0..=n).collect()
+            } else if suffix {
+                vec![n]
             } else {
                 vec![0]
             });
@@ -425,11 +433,61 @@ pub fn align(
         return Ok(result);
     }
 
+    if suffix {
+        let mut consumed = 0;
+        result.distance = {
+            let reverse = Profile::new(Sequence::reversed(query), config.additional_equalities)?;
+            let mut blocks = Vec::new();
+            let search = |k| {
+                if k < lower {
+                    return None;
+                }
+                let window = target.iter().rev().take(m + k).copied();
+                if config.task == AlignmentTask::Distance {
+                    kernel::semiglobal(&reverse, window, k, false, None, &mut blocks)
+                } else {
+                    let (distance, len) = kernel::anchored_last(&reverse, window, k, &mut blocks)?;
+                    consumed = len;
+                    Some(distance)
+                }
+            };
+            search_distance(upper, limit, search)
+        };
+        if let Some(distance) = result.distance {
+            result.ends.push(n as isize - 1);
+            if config.task != AlignmentTask::Distance {
+                let start = n - consumed;
+                result.starts = Some(vec![start]);
+                if config.task == AlignmentTask::Path {
+                    result.path = Some(crate::path::reconstruct(
+                        query,
+                        &target[start..],
+                        config.additional_equalities,
+                        distance,
+                        None,
+                    )?);
+                }
+            }
+        }
+        return Ok(result);
+    }
+
+    if config.mode == AlignmentMode::Global && config.task == AlignmentTask::Path {
+        if let Some((distance, path)) =
+            crate::path::find_global(query, target, config.additional_equalities, limit, 0)?
+        {
+            result.distance = Some(distance);
+            result.ends.push(n as isize - 1);
+            result.starts = Some(vec![0]);
+            result.path = Some(path);
+        }
+        return Ok(result);
+    }
     let profile = Profile::new(Sequence::new(query), config.additional_equalities)?;
     let mut blocks = Vec::new();
-    let mut search = |k| {
+    let search = |k| {
         if config.mode == AlignmentMode::Global {
-            kernel::distance_global(&profile, Sequence::new(target), k)
+            kernel::distance_global(&profile, Sequence::new(target), k, &mut blocks)
         } else {
             kernel::semiglobal(
                 &profile,
@@ -441,10 +499,7 @@ pub fn align(
             )
         }
     };
-    result.distance = match limit {
-        Some(k) => search(k),
-        None => Some(unbounded_distance(upper, search)),
-    };
+    result.distance = search_distance(upper, limit, search);
     let Some(distance) = result.distance else {
         return Ok(result);
     };
@@ -491,10 +546,135 @@ pub fn align(
             &target[start..end],
             config.additional_equalities,
             distance,
-            profile,
+            Some(profile),
         )?);
     }
     Ok(result)
+}
+
+/// Aligns the entire query to one optimal target span and returns forward,
+/// coalesced runs. Does not collect all tied spans or build a unit-operation path.
+///
+/// The cutoff is inclusive; `Ok(None)` means no alignment meets it. For
+/// [`AlignmentMode::Suffix`], ties choose the longest optimal suffix (an empty
+/// query uses the empty span at the end). Other tied paths and spans are not
+/// canonical.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if the required dimensions or buffers
+/// cannot be accommodated.
+pub fn align_runs(
+    query: &[u8],
+    target: &[u8],
+    mode: AlignmentMode,
+    max_distance: Option<usize>,
+    additional_equalities: &[EqualityPair],
+) -> Result<Option<RunAlignment>, AlignError> {
+    if mode == AlignmentMode::Global && additional_equalities.is_empty() {
+        return global::align_runs(query, target, max_distance);
+    }
+
+    let (m, n) = (query.len(), target.len());
+    let upper = if mode == AlignmentMode::Global { m.max(n) } else { m };
+    let limit = max_distance.map(|k| k.min(upper));
+    let extent = match mode {
+        // A longer anchored span would cost more than the cutoff on length alone.
+        AlignmentMode::Prefix | AlignmentMode::Suffix => n.min(m.saturating_add(limit.unwrap_or(upper))),
+        _ => n,
+    };
+    check_lengths(m, extent)?;
+
+    if m == 0 || n == 0 {
+        if limit.is_some_and(|k| k < upper) {
+            return Ok(None);
+        }
+        let span = match mode {
+            AlignmentMode::Global => 0..n,
+            AlignmentMode::Suffix => n..n,
+            _ => 0..0,
+        };
+        let runs = crate::path::reconstruct(query, &target[span.clone()], additional_equalities, upper, None)?;
+        return Ok(Some(RunAlignment { score: upper, target: span, runs }));
+    }
+
+    let lower = if mode == AlignmentMode::Global { m.abs_diff(n) } else { m.saturating_sub(n) };
+    if limit.is_some_and(|k| k < lower) {
+        return Ok(None);
+    }
+    if limit == Some(0) && mode == AlignmentMode::Infix && additional_equalities.is_empty() {
+        let Some(start) = infix::find_exact(query, target)? else { return Ok(None) };
+        let mut runs = Vec::new();
+        runs.try_reserve_exact(1).map_err(|_| AlignError::InputTooLong)?;
+        runs.push(Run { op: EditOperation::Match, len: m });
+        return Ok(Some(RunAlignment { score: 0, target: start..start + m, runs }));
+    }
+    if mode == AlignmentMode::Global {
+        let hit = crate::path::find_global(query, target, additional_equalities, limit, 0)?;
+        return Ok(hit.map(|(score, runs)| RunAlignment { score, target: 0..n, runs }));
+    }
+
+    let suffix = mode == AlignmentMode::Suffix;
+    let infix = mode == AlignmentMode::Infix;
+    let sequence = if suffix { Sequence::reversed(query) } else { Sequence::new(query) };
+    let profile = Profile::new(sequence, additional_equalities)?;
+    let mut blocks = Vec::new();
+    let mut consumed = 0;
+    let score = search_distance(upper, limit, |k| {
+        if k < lower {
+            return None;
+        }
+        let (score, end) = if suffix {
+            let window = target.iter().rev().take(m + k).copied();
+            kernel::anchored_last(&profile, window, k, &mut blocks)
+        } else {
+            let end = if infix { n } else { n.min(m + k) };
+            kernel::semiglobal_first(&profile, target[..end].iter().copied(), k, infix, &mut blocks)
+        }?;
+        consumed = end;
+        Some(score)
+    });
+    let Some(score) = score else { return Ok(None) };
+    let (span, forward) = if suffix {
+        drop(profile);
+        (n - consumed..n, None)
+    } else {
+        let start = if !infix || consumed == 0 {
+            0
+        } else if score == 0 {
+            consumed - m // An exact hit has only one possible start.
+        } else {
+            let reverse = Profile::new(Sequence::reversed(query), additional_equalities)?;
+            let window = target[..consumed].iter().rev().take(m + score).copied();
+            let (reverse_score, len) = kernel::anchored_last(&reverse, window, score, &mut blocks)
+                .expect("the selected optimal end has an optimal start");
+            debug_assert_eq!(reverse_score, score);
+            consumed - len
+        };
+        (start..consumed, Some(profile))
+    };
+    drop(blocks);
+    let runs = crate::path::reconstruct(query, &target[span.clone()], additional_equalities, score, forward)?;
+    Ok(Some(RunAlignment { score, target: span, runs }))
+}
+
+/// A positive number of consecutive operations of the same kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    /// Operation repeated by this run.
+    pub op: EditOperation,
+    /// Number of unit operations.
+    pub len: usize,
+}
+
+/// One optimal alignment of the entire query, with no free flanks in its path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunAlignment {
+    /// Exact unit-cost Levenshtein distance: the sum of the non-match run lengths.
+    pub score: usize,
+    /// Half-open byte range in the original target.
+    pub target: Range<usize>,
+    /// Positive-length, coalesced operations in forward order, including matches.
+    pub runs: Vec<Run>,
 }
 
 /// Owns all result buffers. Accessors borrow without copying; `Send + Sync`.

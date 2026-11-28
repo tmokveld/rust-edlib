@@ -248,7 +248,7 @@ impl Deltas {
 /// `Xh | pv = sum | eq | pv` and `pv & Xh = pv & (eq | !sum)`, removing the
 /// XOR and one OR from the loop-carried dependency chain. Returns `(Ph, Mh)`.
 #[inline(always)]
-fn horizontal(eq: u64, pv: u64, mv: u64) -> (u64, u64) {
+pub(super) fn horizontal(eq: u64, pv: u64, mv: u64) -> (u64, u64) {
     // Overflow is the discarded carry beyond this word, not a Rust overflow.
     let sum = (eq & pv).wrapping_add(pv);
     (mv | !(sum | (eq | pv)), pv & (eq | !sum))
@@ -309,22 +309,44 @@ fn advance_single<const FREE: bool>(
 }
 
 pub(crate) struct Column {
-    pub blocks: Vec<Block>,
-    pub first: usize,
-    pub last: usize,
+    blocks: Vec<Block>,
+    first: usize,
+    last: usize,
 }
 
 impl Column {
+    pub fn band(&self) -> Band<'_> {
+        Band { first: self.first, blocks: &self.blocks[self.first..=self.last] }
+    }
+
     pub fn value(&self, row: usize) -> Option<isize> {
-        let b = row.checked_sub(1)? / 64;
-        (self.first..=self.last)
-            .contains(&b)
-            .then(|| self.blocks[b].value((row - 1) % 64))
+        self.band().value(row)
+    }
+
+    pub fn distance(&self, row: usize, k: usize) -> Option<usize> {
+        self.band().distance(row, k)
     }
 }
 
-/// Compact saved active blocks. Only small subproblems create a Trace; larger
-/// ones retain two columns and recurse. Capacity is checked and reserved once.
+/// A borrowed active column, in absolute block coordinates.
+#[derive(Clone, Copy)]
+pub(crate) struct Band<'a> {
+    pub first: usize,
+    pub blocks: &'a [Block],
+}
+
+impl Band<'_> {
+    pub fn value(self, row: usize) -> Option<isize> {
+        let b = (row.checked_sub(1)? / 64).checked_sub(self.first)?;
+        self.blocks.get(b).map(|block| block.value((row - 1) % 64))
+    }
+
+    fn distance(self, row: usize, k: usize) -> Option<usize> {
+        self.value(row).filter(|&s| s <= k as isize).map(|s| s as usize)
+    }
+}
+
+/// Saved active blocks and their absolute row ranges, one entry per target column.
 pub(crate) struct Trace {
     pub blocks: Vec<Block>,
     pub columns: Vec<(usize, Range<usize>)>,
@@ -412,7 +434,9 @@ pub(crate) fn trace_single(profile: &Profile, target: Sequence<'_>, trace: &mut 
     block.value(profile.len - 1)
 }
 
-pub(crate) fn distance_global(profile: &Profile, target: Sequence<'_>, k: usize) -> Option<usize> {
+pub(crate) fn distance_global(
+    profile: &Profile, target: Sequence<'_>, k: usize, blocks: &mut Vec<Block>,
+) -> Option<usize> {
     if profile.len.abs_diff(target.len()) > k {
         return None;
     }
@@ -436,11 +460,8 @@ pub(crate) fn distance_global(profile: &Profile, target: Sequence<'_>, k: usize)
         return (score <= k as isize).then_some(score as usize);
     }
 
-    let column = global(profile, target, k, target.len(), None)?;
-    column
-        .value(profile.len)
-        .filter(|&s| s <= k as isize)
-        .map(|s| s as usize)
+    let active = global_band(profile, target, k, target.len(), blocks, |_, _, _, _| {})?;
+    Band { first: active.start, blocks: &blocks[active] }.distance(profile.len, k)
 }
 
 /// NW band restricted by both accumulated cost and mandatory remaining length
@@ -453,6 +474,27 @@ pub(crate) fn global(
     stop: usize,
     mut trace: Option<&mut Trace>,
 ) -> Option<Column> {
+    global_recording(profile, target, bound, stop, |_, blocks, first, end| {
+        if let Some(saved) = trace.as_mut() {
+            saved.push(blocks, first, end);
+        }
+    })
+}
+
+/// `record` sees each surviving column (one-based) and its absolute active block range.
+pub(crate) fn global_recording(
+    profile: &Profile, target: Sequence<'_>, bound: usize, stop: usize,
+    record: impl FnMut(usize, &[Block], usize, usize),
+) -> Option<Column> {
+    let mut blocks = Vec::new();
+    let active = global_band(profile, target, bound, stop, &mut blocks, record)?;
+    Some(Column { blocks, first: active.start, last: active.end - 1 })
+}
+
+fn global_band(
+    profile: &Profile, target: Sequence<'_>, bound: usize, stop: usize,
+    blocks: &mut Vec<Block>, mut record: impl FnMut(usize, &[Block], usize, usize),
+) -> Option<Range<usize>> {
     let (m, n, count) = (profile.len as isize, target.len() as isize, profile.blocks);
     if profile.len.abs_diff(target.len()) > bound {
         return None;
@@ -462,9 +504,17 @@ pub(crate) fn global(
     let padding = count as isize * 64 - m;
     let mut first = 0;
     let mut end = count.min(((k.min((k + m - n) / 2) + 1) as usize).div_ceil(64));
-    let mut blocks: Vec<Block> = (0..count)
-        .map(|b| Block::new((b as isize + 1) * 64))
-        .collect();
+    // A retry reuses this column. Reset only its initial band; when the
+    // recurrence admits another block it overwrites that slot before use.
+    let initial = |b: usize| Block::new((b as isize + 1) * 64);
+    if blocks.len() == count {
+        for (b, block) in blocks[..end].iter_mut().enumerate() {
+            *block = initial(b);
+        }
+    } else {
+        *blocks = (0..count).map(initial).collect();
+    }
+    let blocks = blocks.as_mut_slice();
 
     for c in 0..stop {
         let row = profile.row(target.at(c));
@@ -540,44 +590,60 @@ pub(crate) fn global(
         if first == end {
             return None;
         }
-        if let Some(saved) = trace.as_mut() {
-            saved.push(&blocks, first, end);
-        }
+        record(c as usize + 1, blocks, first, end);
     }
 
-    Some(Column {
-        blocks,
-        first,
-        last: end - 1,
-    })
+    Some(first..end)
+}
+
+enum SemiEnds<'a> {
+    ScoreOnly,
+    All(&'a mut Vec<isize>),
+    First(&'a mut usize),
+    LastAnchored(&'a mut usize),
 }
 
 struct SemiBest<'a> {
     k: isize,
     distance: Option<usize>,
-    ends: Option<&'a mut Vec<isize>>,
+    ends: SemiEnds<'a>,
 }
 
 impl SemiBest<'_> {
-    /// Record an admissible score. Only a score-only search can finish at zero.
+    /// Record an admissible score. Only searches with no more relevant ties stop at zero.
     #[inline]
     fn report(&mut self, score: isize, end: isize) -> bool {
         if score > self.k {
             return false;
         }
         self.distance = Some(score as usize);
-        if let Some(ends) = &mut self.ends {
-            if score < self.k {
-                ends.clear();
+        match &mut self.ends {
+            SemiEnds::All(ends) => {
+                if score < self.k {
+                    ends.clear();
+                }
+                ends.push(end);
+                self.k = score;
+                false
             }
-            ends.push(end);
-            self.k = score;
-            false
-        } else if score == 0 {
-            true
-        } else {
-            self.k = score - 1; // Ties cannot improve a score-only result.
-            false
+            SemiEnds::First(consumed) => {
+                **consumed = (end + 1) as usize;
+                if score == 0 {
+                    return true;
+                }
+                self.k = score - 1;
+                false
+            }
+            SemiEnds::LastAnchored(consumed) => {
+                **consumed = (end + 1) as usize;
+                self.k = score;
+                score == 0 // A zero-cost anchored match has exactly one length.
+            }
+            SemiEnds::ScoreOnly if score == 0 => true,
+            SemiEnds::ScoreOnly => {
+                self.k = score - 1; // Ties cannot improve a score-only result.
+                false
+            }
         }
     }
 }
@@ -605,16 +671,58 @@ pub(crate) fn semiglobal(
     target: impl Iterator<Item = u8>,
     bound: usize,
     free: bool,
-    mut ends: Option<&mut Vec<isize>>,
+    ends: Option<&mut Vec<isize>>,
     blocks: &mut Vec<Block>,
 ) -> Option<usize> {
-    if let Some(ends) = &mut ends {
-        ends.clear();
-    }
+    let ends = match ends {
+        Some(ends) => {
+            ends.clear();
+            SemiEnds::All(ends)
+        }
+        None => SemiEnds::ScoreOnly,
+    };
+    semi_search(profile, target, bound, free, ends, blocks)
+}
+
+/// Score and first optimal exclusive end, including the empty prefix.
+pub(crate) fn semiglobal_first(
+    profile: &Profile,
+    target: impl Iterator<Item = u8>,
+    bound: usize,
+    free: bool,
+    blocks: &mut Vec<Block>,
+) -> Option<(usize, usize)> {
+    let mut consumed = 0;
+    let score = semi_search(profile, target, bound, free, SemiEnds::First(&mut consumed), blocks)?;
+    Some((score, consumed))
+}
+
+/// Score and length of the longest optimal prefix in traversal order.
+pub(crate) fn anchored_last(
+    profile: &Profile,
+    target: impl Iterator<Item = u8>,
+    bound: usize,
+    blocks: &mut Vec<Block>,
+) -> Option<(usize, usize)> {
+    let mut consumed = 0;
+    let score = semi_search(
+        profile, target, bound, false, SemiEnds::LastAnchored(&mut consumed), blocks,
+    )?;
+    Some((score, consumed))
+}
+
+fn semi_search(
+    profile: &Profile,
+    target: impl Iterator<Item = u8>,
+    bound: usize,
+    free: bool,
+    ends: SemiEnds<'_>,
+    blocks: &mut Vec<Block>,
+) -> Option<usize> {
     let mut best = SemiBest { k: bound.min(profile.len) as isize, distance: None, ends };
     // Edlib omits boundary zero for a whole-word query and a nonempty target.
     // That reporting convention does not exclude the empty substring as a score.
-    if profile.len % 64 != 0 || best.ends.is_none() {
+    if profile.len % 64 != 0 || !matches!(best.ends, SemiEnds::All(_)) {
         best.report(profile.len as isize, -1);
     }
     if profile.len <= 64 {
@@ -818,8 +926,9 @@ mod tests {
                             .map(|_| b"ACGTNacgt"[next(symbols) as usize])
                             .collect();
                         let profile = Profile::new(Sequence::new(&query), extra).unwrap();
-                        let distance =
-                            distance_global(&profile, Sequence::new(&target), len.max(n)).unwrap();
+                        let distance = distance_global(
+                            &profile, Sequence::new(&target), len.max(n), &mut Vec::new(),
+                        ).unwrap();
                         let mut expected = Trace::new(1, n).unwrap();
                         let column = global(
                             &profile,

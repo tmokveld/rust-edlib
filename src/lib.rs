@@ -14,10 +14,11 @@ pub mod aligner;
 mod kernel;
 mod myers;
 mod path;
+mod word;
 
 pub use aligner::{
     AlignConfig, AlignError, Alignment, AlignmentMode, AlignmentTask, Cigar, CigarFormat,
-    EditOperation, EqualityPair, align, distance, distance_at_most, infix_distance,
-    infix_distance_at_most, prefix_distance, prefix_distance_at_most, suffix_distance,
-    suffix_distance_at_most,
+    EditOperation, EqualityPair, GlobalProbe, Run, RunAlignment, align, align_runs, distance,
+    distance_at_most, distance_with_hint, infix_distance, infix_distance_at_most, prefix_distance,
+    prefix_distance_at_most, suffix_distance, suffix_distance_at_most,
 };

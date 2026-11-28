@@ -29,19 +29,21 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: Martinsos/edlib
           ref: f8afceb49ab0095c852e0b8b488ae2c88e566afd # python-1.3.9
           path: target/edlib-upstream
           persist-credentials: false
-      - name: Compare with upstream Edlib
+      - name: Compare with upstream Edlib and the Rust baseline
         shell: bash
         env:
           EDLIB_SOURCE: ${{ github.workspace }}/target/edlib-upstream
+          RUST_BASELINE: 09c70aef239d3e438c8e67d2ed4d2ed7cc174ab0
         run: |
           rustc +stable --version
           c++ --version
-          echo '### Release benchmark vs. upstream Edlib 1.3.9' >> "$GITHUB_STEP_SUMMARY"
-          cargo +stable run --locked --release --manifest-path tools/edlib-bench/Cargo.toml \
+          echo '### Release benchmark' >> "$GITHUB_STEP_SUMMARY"
+          sh tools/edlib-bench/run.sh --against "$RUST_BASELINE" --sample-size 10 \
             | tee -a "$GITHUB_STEP_SUMMARY"
