@@ -10,6 +10,9 @@ const TRACE_BYTES: usize = 1024 * 1024;
 
 /// A monomorphized output of the same forward traversal and backward leaves.
 pub(crate) trait Output: Sized {
+    // Unit paths preserve the historical placement across Hirschberg leaves.
+    const LEGACY_SPLIT_TIES: bool = false;
+
     type Tail;
 
     fn single(operation: EditOperation, count: usize) -> Self;
@@ -28,6 +31,8 @@ pub(crate) trait Output: Sized {
 }
 
 impl Output for Vec<EditOperation> {
+    const LEGACY_SPLIT_TIES: bool = true;
+
     type Tail = ();
 
     fn single(operation: EditOperation, count: usize) -> Self {
@@ -111,17 +116,100 @@ impl Output for Vec<Run> {
     }
 }
 
+/// A global traceback with one byte on the shorter side. It pairs that byte
+/// once and uses only gaps of the same type on either side of the pairing.
+pub(crate) struct OneByte {
+    gap: EditOperation,
+    diagonal: EditOperation,
+    before: usize,
+    after: usize,
+}
+
+impl OneByte {
+    pub(crate) fn literal(query: &[u8], target: &[u8]) -> Self {
+        Self::find(query, target, &[], false)
+    }
+
+    fn find(query: &[u8], target: &[u8], pairs: &[EqualityPair], split: bool) -> Self {
+        let (byte, long, gap) = if query.len() == 1 {
+            (query[0], target, EditOperation::Delete)
+        } else {
+            debug_assert_eq!(target.len(), 1);
+            (target[0], query, EditOperation::Insert)
+        };
+        let (before, matched) = if pairs.is_empty() {
+            one_byte_position(long, |&b| b == byte, split)
+        } else {
+            let mut equal = [false; 256];
+            equal[usize::from(byte)] = true;
+            for &EqualityPair { first, second } in pairs {
+                if first == byte {
+                    equal[usize::from(second)] = true;
+                } else if second == byte {
+                    equal[usize::from(first)] = true;
+                }
+            }
+            one_byte_position(long, |&b| equal[usize::from(b)], split)
+        };
+        Self {
+            gap,
+            diagonal: if matched { EditOperation::Match } else { EditOperation::Mismatch },
+            before,
+            after: long.len() - 1 - before,
+        }
+    }
+
+    pub(crate) fn score(&self) -> usize {
+        self.before + self.after + usize::from(self.diagonal == EditOperation::Mismatch)
+    }
+
+    pub(crate) fn run_count(&self) -> usize {
+        1 + usize::from(self.before != 0) + usize::from(self.after != 0)
+    }
+
+    pub(crate) fn runs(self) -> impl Iterator<Item = Run> {
+        [
+            Run { op: self.gap, len: self.before },
+            Run { op: self.diagonal, len: 1 },
+            Run { op: self.gap, len: self.after },
+        ].into_iter().filter(|run| run.len != 0)
+    }
+}
+
+fn one_byte_position(long: &[u8], equal: impl Fn(&u8) -> bool, split: bool) -> (usize, bool) {
+    // Backward traceback prefers gaps over a diagonal, leaving the first
+    // match (or the first byte on a miss) inside a leaf.
+    if !split {
+        return long.iter().position(equal).map_or((0, false), |i| (i, true));
+    }
+
+    // Hirschberg tries row 0 before row 1: the right half wins if it has a
+    // match, or if both halves miss. Locate that leaf with the last match,
+    // then search its unvisited prefix for the first match within the leaf.
+    let last = long.iter().rposition(&equal);
+    let pivot = last.unwrap_or(long.len() - 1);
+    let (mut start, mut len) = (0, long.len());
+    while !trace_fits(1, len) {
+        let middle = len / 2;
+        if pivot - start < middle {
+            len = middle;
+        } else {
+            start += middle;
+            len -= middle;
+        }
+    }
+    match last {
+        Some(i) => (start + long[start..i].iter().position(equal).unwrap_or(i - start), true),
+        None => (start, false),
+    }
+}
+
 /// Score and recover one global path. Never called for a locations or distance task.
 /// `prefix` prepends already matched bytes without shifting the recovered output.
 pub(crate) fn find_global<O: Output>(
     query: &[u8], target: &[u8], pairs: &[EqualityPair], limit: Option<usize>, prefix: usize,
 ) -> Result<Option<(usize, O)>, AlignError> {
     let (m, n) = (query.len(), target.len());
-    // Distance zero has no DP replay to save. Literal equality suffices even
-    // with extra equality pairs; differing bytes must still go through Myers.
-    if query == target {
-        return Ok(Some((0, O::single(EditOperation::Match, prefix + m))));
-    }
     let buffer = |d| {
         let mut output = O::buffer(prefix + m, prefix + n, d)?;
         if prefix != 0 {
@@ -129,6 +217,27 @@ pub(crate) fn find_global<O: Output>(
         }
         Ok::<O, AlignError>(output)
     };
+    if m.min(n) == 1 {
+        let split = O::LEGACY_SPLIT_TIES && m == 1 && !trace_fits(1, n);
+        let single = OneByte::find(query, target, pairs, split);
+        let score = single.score();
+        if limit.is_some_and(|k| score > k) {
+            return Ok(None);
+        }
+        if score == 0 {
+            return Ok(Some((0, O::single(EditOperation::Match, prefix + m))));
+        }
+        let mut output = buffer(score)?;
+        for Run { op, len } in single.runs() {
+            output.append_run(0, op, len)?;
+        }
+        return Ok(Some((score, output)));
+    }
+    // Distance zero has no DP replay to save. Literal equality suffices even
+    // with extra equality pairs; differing bytes must still go through Myers.
+    if query == target {
+        return Ok(Some((0, O::single(EditOperation::Match, prefix + m))));
+    }
     let profile = Profile::new(Sequence::new(query), pairs)?;
     let seq = Sequence::new(target);
     if trace_fits(profile.blocks, n) {

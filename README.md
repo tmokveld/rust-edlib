@@ -66,6 +66,11 @@ fn main() -> Result<(), AlignError> {
 Use `align` for optimal ends, custom byte equalities, or an edit path. Even with
 `AlignmentTask::Distance`, infix `align` collects all reported optimal ends.
 `infix_distance` needs only the score and stops at the first exact match.
+When you also need the range but not a path, `prefix_locate`, `suffix_locate`, and
+`infix_locate` return one optimal half-open target span and its score using
+literal byte equality. The prefix starts at zero; the suffix ends at the target
+length and is the longest optimal suffix. Spans can be empty. The corresponding
+`*_locate_at_most` functions return `Ok(None)` on an inclusive cutoff miss.
 
 ```rust
 use rust_edlib::{AlignConfig, AlignError, AlignmentMode, AlignmentTask, CigarFormat, align};
@@ -90,12 +95,13 @@ Use `align_runs` when you need one optimal target range and a coalesced path,
 not every tied location or a byte per operation:
 
 ```rust
-use rust_edlib::{AlignError, AlignmentMode, EditOperation, Run, align_runs};
+use rust_edlib::{AlignError, AlignmentMode, CigarFormat, EditOperation, Run, align_runs};
 
 fn main() -> Result<(), AlignError> {
     let hit = align_runs(b"TAG", b"xxTAG", AlignmentMode::Suffix, Some(0), &[])?.unwrap();
     assert_eq!(hit.target, 2..5);
     assert_eq!(hit.runs, [Run { op: EditOperation::Match, len: 3 }]);
+    assert_eq!(hit.cigar(CigarFormat::Extended).to_string(), "3=");
     Ok(())
 }
 ```
@@ -124,15 +130,9 @@ returns `None`, the ends are empty, and starts and path are absent. This
 differs from a zero distance and from `AlignError::InputTooLong`, which
 means required sizes or band arithmetic exceed platform limits.
 
-All 256 byte values are valid, including NUL and bytes that are not valid UTF-8.
-Pass a slice of `EqualityPair` values as `additional_equalities` to treat
-different bytes as matches. For example, `EqualityPair::new(b'A', b'a')`
-adds equality in both directions. Every byte equals itself; pairs are not
-transitive, so adding `A = G` and `G = C` does not add `A = C`.
-
 ## Spans, paths, and CIGAR
 
-`locations()` yields half-open target byte ranges in increasing end order;
+`locations()` yields half-open target byte ranges in increasing end order,
 `start_locations()` gives the starts alone. `end_offsets()` yields exclusive
 end offsets even with the `Distance` task. For Edlib compatibility,
 `end_locations()` yields inclusive ends, where `-1` means end offset zero.
@@ -140,11 +140,8 @@ Global and prefix spans start at zero. For each reported infix end,
 `locations()` uses the earliest optimal start.
 `path()` covers only the first reported span. `Insert` consumes a query byte,
 `Delete` consumes a target byte, and `Match` and `Mismatch` consume one byte
-from each. Extended CIGAR uses `=`, `X`, `I`, and `D`; standard CIGAR merges
-adjacent matches and mismatches into `M` runs. Neither includes free target
-flanks. The result owns its buffers and is `Send + Sync`; accessors borrow
-without copying, and `cigar()` returns a formatter that writes directly to
-its destination.
+from each. Extended CIGAR uses `=`, `X`, `I`, and `D`, standard CIGAR merges
+adjacent matches and mismatches into `M` runs.
 
 ## Build, test, and docs
 

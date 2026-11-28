@@ -3,7 +3,7 @@ mod common;
 use common::{MODES, binary_strings, equal, limits, quadratic};
 use rust_edlib::{
     AlignConfig, AlignmentMode, AlignmentTask, EditOperation, EqualityPair, GlobalProbe, Run,
-    RunAlignment, align, align_runs,
+    RunAlignment, align, align_runs, infix_locate, infix_locate_at_most,
 };
 
 fn replay(query: &[u8], target: &[u8], pairs: &[EqualityPair], alignment: &RunAlignment) {
@@ -41,6 +41,16 @@ fn check(query: &[u8], target: &[u8], pairs: &[EqualityPair]) {
             assert_eq!(result.as_ref().map(|hit| hit.score),
                 bound.is_none_or(|k| expected.distance <= k).then_some(expected.distance),
                 "mode={mode:?}, bound={bound:?}, query={query:?}, target={target:?}");
+            if mode == AlignmentMode::Infix && pairs.is_empty() {
+                let location = match bound {
+                    Some(k) => infix_locate_at_most(query, target, k).unwrap(),
+                    None => Some(infix_locate(query, target).unwrap()),
+                };
+                assert_eq!(location.as_ref().map(|l| l.score), result.as_ref().map(|hit| hit.score));
+                if let Some(hit) = location {
+                    assert_eq!(quadratic(query, &target[hit.target], AlignmentMode::Global, pairs).distance, expected.distance);
+                }
+            }
             let Some(alignment) = result else { continue };
             match mode {
                 AlignmentMode::Global => assert_eq!(alignment.target, 0..target.len()),
@@ -197,6 +207,125 @@ fn literal_shortcuts_preserve_legacy_ties_and_do_not_use_custom_equalities() {
     let hit = align_runs(&[b'A'; 384], &[b'a'; 384], AlignmentMode::Global, Some(32), &pairs)
         .unwrap().unwrap();
     assert_eq!(hit.runs, [Run { op: Match, len: 384 }]);
+}
+
+#[test]
+fn one_byte_literal_runs_preserve_trim_and_inclusive_bounds() {
+    use EditOperation::{Delete, Insert, Match, Mismatch};
+
+    let short = b"P\xffS";
+    for (long, diagonal, before, after, score) in [
+        (b"P\x00\xff\x00\xff\x00S", Match, 1, 3, 4),
+        (b"P\x00\x01\x00\x01\x00S", Mismatch, 0, 4, 5),
+    ] {
+        for (query, target, gap) in [
+            (&short[..], &long[..], Delete),
+            (&long[..], &short[..], Insert),
+        ] {
+            let mut runs = vec![Run { op: Match, len: 1 }];
+            if before != 0 {
+                runs.push(Run { op: gap, len: before });
+            }
+            runs.extend([
+                Run { op: diagonal, len: 1 },
+                Run { op: gap, len: after },
+                Run { op: Match, len: 1 },
+            ]);
+            let expected = RunAlignment { score, target: 0..target.len(), runs };
+            let probe = GlobalProbe::new(query, target);
+            for bound in limits(score) {
+                let expected = bound.is_none_or(|k| score <= k).then_some(&expected);
+                assert_eq!(align_runs(query, target, AlignmentMode::Global, bound, &[]).unwrap().as_ref(), expected);
+                assert_eq!(probe.align_runs(bound).unwrap().as_ref(), expected);
+            }
+        }
+    }
+
+    let probe = GlobalProbe::new(b"PxS", b"PyS");
+    assert_eq!(probe.diagonal_score(), Some(1));
+    assert_eq!(probe.align_runs(Some(0)), Ok(None));
+    let hit = probe.align_runs(Some(1)).unwrap().unwrap();
+    assert_eq!(hit.cigar(rust_edlib::CigarFormat::Extended).to_string(), "1=1X1=");
+}
+
+#[test]
+fn one_byte_shared_trace_uses_direct_symmetric_equalities() {
+    use EditOperation::{Delete, Insert, Match, Mismatch};
+
+    let short = [255];
+    let pairs = [EqualityPair::new(0, 255), EqualityPair::new(0, 128), EqualityPair::new(255, 127)];
+    for (long, before, diagonal) in [
+        (&[128, 0, 255, 0, 128][..], 1, Match),
+        (&[128, 255, 128][..], 1, Match),
+        (&[128, 127, 128][..], 1, Match),
+        (&[128; 5][..], 0, Mismatch),
+        (&[0][..], 0, Match),
+        (&[128][..], 0, Mismatch),
+    ] {
+        let score = long.len() - usize::from(diagonal == Match);
+        for (query, target, gap) in [
+            (&short[..], long, Delete),
+            (long, &short[..], Insert),
+        ] {
+            let after = long.len() - 1 - before;
+            let runs: Vec<_> = [
+                Run { op: gap, len: before },
+                Run { op: diagonal, len: 1 },
+                Run { op: gap, len: after },
+            ].into_iter().filter(|run| run.len != 0).collect();
+            let unit: Vec<_> = runs.iter().flat_map(|r| std::iter::repeat_n(r.op, r.len)).collect();
+            let expected = RunAlignment { score, target: 0..target.len(), runs };
+            for bound in limits(score) {
+                let found = bound.is_none_or(|k| score <= k);
+                assert_eq!(align_runs(query, target, AlignmentMode::Global, bound, &pairs).unwrap().as_ref(),
+                    found.then_some(&expected));
+                let legacy = align(query, target, &AlignConfig {
+                    task: AlignmentTask::Path,
+                    max_distance: bound,
+                    additional_equalities: &pairs,
+                    ..Default::default()
+                }).unwrap();
+                assert_eq!(legacy.edit_distance(), found.then_some(score));
+                assert_eq!(legacy.path(), found.then_some(unit.as_slice()));
+            }
+        }
+    }
+}
+
+#[test]
+fn one_byte_trace_avoids_a_wide_profile_and_preserves_legacy_split_ties() {
+    use EditOperation::{Delete, Insert, Match, Mismatch};
+
+    let short = [255];
+    let mut long: Vec<_> = (0..255u8).cycle().take(40_000).collect();
+    let len = long.len();
+    let gap = len - 1;
+    assert_eq!(align_runs(&long, &short, AlignmentMode::Global, Some(gap), &[]), Ok(None));
+    assert_eq!(align_runs(&long, &short, AlignmentMode::Global, Some(len), &[]), Ok(Some(RunAlignment {
+        score: len, target: 0..1,
+        runs: vec![Run { op: Mismatch, len: 1 }, Run { op: Insert, len: gap }],
+    })));
+
+    let middle = len / 2; // One split; both halves fit the legacy trace budget.
+    for (new_matches, chosen, diagonal) in [
+        (&[][..], middle, Mismatch),
+        (&[2][..], 2, Match),
+        (&[middle + 3, middle + 7][..], middle + 3, Match),
+    ] {
+        for &i in new_matches {
+            long[i] = short[0];
+        }
+        let score = len - usize::from(diagonal == Match);
+        for max_distance in [None, Some(score)] {
+            let config = AlignConfig { task: AlignmentTask::Path, max_distance, ..Default::default() };
+            let result = align(&short, &long, &config).unwrap();
+            assert_eq!(result.edit_distance(), Some(score));
+            let path = result.path().unwrap();
+            assert_eq!(path.len(), len);
+            assert_eq!(path[chosen], diagonal);
+            assert!(path[..chosen].iter().chain(&path[chosen + 1..]).all(|&op| op == Delete));
+        }
+    }
 }
 
 #[test]

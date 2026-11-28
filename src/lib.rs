@@ -6,7 +6,9 @@
 //! [`infix_distance_at_most`], return `Ok(Some(d))` when the minimum score `d`
 //! is at most the cutoff, or `Ok(None)` otherwise. An infix score-only search
 //! stops at the first exact match; [`align`] collects optimal ends even for
-//! [`AlignmentTask::Distance`].
+//! [`AlignmentTask::Distance`]. Use [`prefix_locate`], [`suffix_locate`], or
+//! [`infix_locate`] to get just one score and span. Their bounded variants
+//! return `Ok(None)` when the best span exceeds the cutoff.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -18,7 +20,9 @@ mod word;
 
 pub use aligner::{
     AlignConfig, AlignError, Alignment, AlignmentMode, AlignmentTask, Cigar, CigarFormat,
-    EditOperation, EqualityPair, GlobalProbe, Run, RunAlignment, align, align_runs, distance,
-    distance_at_most, distance_with_hint, infix_distance, infix_distance_at_most, prefix_distance,
-    prefix_distance_at_most, suffix_distance, suffix_distance_at_most,
+    EditOperation, EqualityPair, GlobalProbe, Location, Run, RunAlignment, align, align_runs,
+    distance, distance_at_most, distance_with_hint, infix_distance, infix_distance_at_most,
+    infix_locate, infix_locate_at_most, prefix_distance, prefix_distance_at_most, prefix_locate,
+    prefix_locate_at_most, suffix_distance, suffix_distance_at_most, suffix_locate,
+    suffix_locate_at_most,
 };

@@ -71,8 +71,6 @@ impl Profile {
                 rows += 1;
             }
         };
-        // Precheck makes the per-symbol offset multiplication safe.
-        check_buffer::<u64>(blocks.checked_mul(257).ok_or(AlignError::InputTooLong)?)?;
         for i in 0..query.len() {
             add(query.at(i));
         }
@@ -80,7 +78,10 @@ impl Profile {
             add(pair.first);
             add(pair.second);
         }
-        let mut words = vec![0; rows * blocks];
+        let size = blocks.checked_mul(rows).ok_or(AlignError::InputTooLong)?;
+        let mut words = Vec::new();
+        words.try_reserve_exact(size).map_err(|_| AlignError::InputTooLong)?;
+        words.resize(size, 0);
         // Row IDs below `rows` need `bits` bits. Tiny alphabets use bit planes
         // in registers; others scatter. The scatter's read-modify-write chains
         // serialize through memory whenever a symbol repeats closely.

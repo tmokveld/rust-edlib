@@ -191,6 +191,14 @@ impl<'a> Core<'a> {
         if limit == Some(0) {
             return Ok(None); // The trimmed core starts at a mismatch.
         }
+        if m.min(n) == 1 {
+            let single = path::OneByte::literal(self.query, self.target);
+            let score = single.score();
+            if limit.is_some_and(|k| score > k) {
+                return Ok(None);
+            }
+            return self.framed_runs(score, single.run_count(), |runs| runs.extend(single.runs())).map(Some);
+        }
         if limit == Some(gap) || (gap > 32 && gap >= m.min(n).div_ceil(2)) {
             if let Some(hit) = self.subsequence_runs(gap)? {
                 return Ok(Some(hit));
@@ -231,7 +239,8 @@ impl<'a> Core<'a> {
         self.framed_runs(diagonal.score, core_runs, |runs| {
             let mut i = 0;
             while i < self.query.len() {
-                let changed = self.query[i..].iter().zip(&self.target[i..]).take_while(|(x, y)| x != y).count();
+                // Trimming (or the preceding match block) already found this mismatch.
+                let changed = 1 + self.query[i + 1..].iter().zip(&self.target[i + 1..]).take_while(|(x, y)| x != y).count();
                 runs.push(Run { op: EditOperation::Mismatch, len: changed });
                 i += changed;
                 let matched = common_end::<false>(&self.query[i..], &self.target[i..]);

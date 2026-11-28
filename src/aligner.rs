@@ -95,9 +95,9 @@ fn check_lengths(m: usize, n: usize) -> Result<(), AlignError> {
     Ok(())
 }
 
-pub(crate) fn search_distance(
-    upper: usize, limit: Option<usize>, mut search: impl FnMut(usize) -> Option<usize>,
-) -> Option<usize> {
+pub(crate) fn search_distance<T>(
+    upper: usize, limit: Option<usize>, mut search: impl FnMut(usize) -> Option<T>,
+) -> Option<T> {
     if let Some(k) = limit {
         return search(k);
     }
@@ -236,8 +236,13 @@ fn anchored_distance<const REVERSE: bool>(
     target: &[u8],
     k: usize,
 ) -> Result<Option<usize>, AlignError> {
-    if query.len().saturating_sub(target.len()) > k {
+    let gap = query.len().saturating_sub(target.len());
+    if gap > k {
         return Ok(None);
+    }
+    if gap != 0 && k == gap {
+        // No shorter prefix or suffix can fit this cutoff.
+        return global::distance_at_most(query, target, k);
     }
     let shared = if REVERSE {
         query.iter().rev().zip(target.iter().rev()).take_while(|(a, b)| a == b).count()
@@ -337,6 +342,92 @@ pub fn infix_distance_at_most(
         // A narrow miss rules out this budget, not a match. Replay from column zero.
         bound = bound.saturating_mul(2).min(limit);
     }
+}
+
+/// One optimal placement of the entire query, without an edit path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    /// Exact unit-cost Levenshtein distance to the reported substring.
+    pub score: usize,
+    /// Half-open byte range in the original target. May be empty.
+    pub target: Range<usize>,
+}
+
+/// Locates one optimal target substring without constructing a path or collecting
+/// tied locations. Tied spans are not canonical.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+pub fn infix_locate(query: &[u8], target: &[u8]) -> Result<Location, AlignError> {
+    Ok(infix_locate_at_most(query, target, query.len())?.expect("the empty substring is within the bound"))
+}
+
+/// Returns one optimal [`Location`] at or below the inclusive cutoff `k`.
+/// `Ok(None)` means every target substring costs more.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+///
+/// ```
+/// let hit = rust_edlib::infix_locate_at_most(b"abc", b"__axc__", 1)?.unwrap();
+/// assert_eq!((hit.score, hit.target), (1, 2..5));
+/// assert_eq!(rust_edlib::infix_locate_at_most(b"abc", b"__axc__", 0)?, None);
+/// # Ok::<(), rust_edlib::AlignError>(())
+/// ```
+pub fn infix_locate_at_most(query: &[u8], target: &[u8], k: usize) -> Result<Option<Location>, AlignError> {
+    locate_at_most(query, target, AlignmentMode::Infix, k)
+}
+
+/// Locates one optimal prefix of `target` for the entire `query`, using literal
+/// byte equality. The half-open span starts at zero and may be empty.
+/// Does not construct a path or collect ties. Tied spans are not canonical.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+pub fn prefix_locate(query: &[u8], target: &[u8]) -> Result<Location, AlignError> {
+    Ok(prefix_locate_at_most(query, target, query.len())?
+        .expect("the empty prefix is within the bound"))
+}
+
+/// Returns one optimal prefix [`Location`] at or below the inclusive cutoff `k`.
+/// `Ok(None)` means every target prefix costs more.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+pub fn prefix_locate_at_most(
+    query: &[u8], target: &[u8], k: usize,
+) -> Result<Option<Location>, AlignError> {
+    locate_at_most(query, target, AlignmentMode::Prefix, k)
+}
+
+/// Locates one optimal suffix of `target` for the entire `query`, using literal
+/// byte equality. The half-open span ends at `target.len()` and may be empty.
+/// Does not construct a path or collect ties; it returns the longest optimal
+/// suffix.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+pub fn suffix_locate(query: &[u8], target: &[u8]) -> Result<Location, AlignError> {
+    Ok(suffix_locate_at_most(query, target, query.len())?
+        .expect("the empty suffix is within the bound"))
+}
+
+/// Returns the longest optimal suffix [`Location`] at or below the inclusive
+/// cutoff `k`. `Ok(None)` means every target suffix costs more.
+///
+/// # Errors
+/// Returns [`AlignError::InputTooLong`] if required dimensions or buffers cannot be accommodated.
+pub fn suffix_locate_at_most(
+    query: &[u8], target: &[u8], k: usize,
+) -> Result<Option<Location>, AlignError> {
+    locate_at_most(query, target, AlignmentMode::Suffix, k)
+}
+
+fn locate_at_most(
+    query: &[u8], target: &[u8], mode: AlignmentMode, k: usize,
+) -> Result<Option<Location>, AlignError> {
+    let limit = (k < query.len()).then_some(k); // The empty span always costs query.len().
+    semiglobal_location(query, target, mode, limit, &[], None)
 }
 
 /// Align arbitrary bytes without copying the inputs. The result borrows neither
@@ -570,76 +661,114 @@ pub fn align_runs(
     max_distance: Option<usize>,
     additional_equalities: &[EqualityPair],
 ) -> Result<Option<RunAlignment>, AlignError> {
-    if mode == AlignmentMode::Global && additional_equalities.is_empty() {
-        return global::align_runs(query, target, max_distance);
-    }
-
-    let (m, n) = (query.len(), target.len());
-    let upper = if mode == AlignmentMode::Global { m.max(n) } else { m };
-    let limit = max_distance.map(|k| k.min(upper));
-    let extent = match mode {
-        // A longer anchored span would cost more than the cutoff on length alone.
-        AlignmentMode::Prefix | AlignmentMode::Suffix => n.min(m.saturating_add(limit.unwrap_or(upper))),
-        _ => n,
-    };
-    check_lengths(m, extent)?;
-
-    if m == 0 || n == 0 {
-        if limit.is_some_and(|k| k < upper) {
+    if mode == AlignmentMode::Global {
+        if additional_equalities.is_empty() {
+            return global::align_runs(query, target, max_distance);
+        }
+        let (m, n) = (query.len(), target.len());
+        check_lengths(m, n)?;
+        if max_distance.is_some_and(|k| k < m.abs_diff(n)) {
             return Ok(None);
         }
-        let span = match mode {
-            AlignmentMode::Global => 0..n,
-            AlignmentMode::Suffix => n..n,
-            _ => 0..0,
-        };
-        let runs = crate::path::reconstruct(query, &target[span.clone()], additional_equalities, upper, None)?;
-        return Ok(Some(RunAlignment { score: upper, target: span, runs }));
-    }
-
-    let lower = if mode == AlignmentMode::Global { m.abs_diff(n) } else { m.saturating_sub(n) };
-    if limit.is_some_and(|k| k < lower) {
-        return Ok(None);
-    }
-    if limit == Some(0) && mode == AlignmentMode::Infix && additional_equalities.is_empty() {
-        let Some(start) = infix::find_exact(query, target)? else { return Ok(None) };
-        let mut runs = Vec::new();
-        runs.try_reserve_exact(1).map_err(|_| AlignError::InputTooLong)?;
-        runs.push(Run { op: EditOperation::Match, len: m });
-        return Ok(Some(RunAlignment { score: 0, target: start..start + m, runs }));
-    }
-    if mode == AlignmentMode::Global {
+        if m == 0 || n == 0 {
+            let score = m.max(n);
+            let runs = crate::path::reconstruct(query, target, additional_equalities, score, None)?;
+            return Ok(Some(RunAlignment { score, target: 0..n, runs }));
+        }
+        let limit = max_distance.map(|k| k.min(m.max(n)));
         let hit = crate::path::find_global(query, target, additional_equalities, limit, 0)?;
         return Ok(hit.map(|(score, runs)| RunAlignment { score, target: 0..n, runs }));
     }
 
+    if additional_equalities.is_empty() && matches!(mode, AlignmentMode::Prefix | AlignmentMode::Suffix) {
+        let gap = query.len().saturating_sub(target.len());
+        if gap != 0 && max_distance == Some(gap) {
+            // The full target is the only span that can fit the cutoff.
+            return global::align_runs(query, target, max_distance);
+        }
+    }
+
+    let mut forward = None;
+    let Some(Location { score, target: span }) =
+        semiglobal_location(query, target, mode, max_distance, additional_equalities, Some(&mut forward))?
+    else { return Ok(None) };
+    let runs = if score == 0 && !query.is_empty() {
+        let mut runs = Vec::new();
+        runs.try_reserve_exact(1).map_err(|_| AlignError::InputTooLong)?;
+        runs.push(Run { op: EditOperation::Match, len: query.len() });
+        runs
+    } else {
+        crate::path::reconstruct(query, &target[span.clone()], additional_equalities, score, forward)?
+    };
+    Ok(Some(RunAlignment { score, target: span, runs }))
+}
+
+// Select a single span. Only traceback retains the forward query profile; a
+// range-only caller releases it before allocating a reverse profile for the start.
+fn semiglobal_location(
+    query: &[u8], target: &[u8], mode: AlignmentMode, max_distance: Option<usize>,
+    additional_equalities: &[EqualityPair], save_forward: Option<&mut Option<Profile>>,
+) -> Result<Option<Location>, AlignError> {
+    debug_assert_ne!(mode, AlignmentMode::Global);
+    let (m, n) = (query.len(), target.len());
+    let limit = max_distance.map(|k| k.min(m));
+    let lower = m.saturating_sub(n);
+    if limit.is_some_and(|k| k < lower) {
+        return Ok(None);
+    }
     let suffix = mode == AlignmentMode::Suffix;
     let infix = mode == AlignmentMode::Infix;
+    if m == 0 || n == 0 {
+        let end = if suffix { n } else { 0 };
+        return Ok(Some(Location { score: m, target: end..end }));
+    }
+    if additional_equalities.is_empty() {
+        if limit == Some(0) {
+            if infix {
+                return Ok(infix::find_exact(query, target)?.map(|i| Location { score: 0, target: i..i + m }));
+            }
+            let span = if suffix {
+                target.ends_with(query).then(|| n - m..n)
+            } else {
+                target.starts_with(query).then_some(0..m)
+            };
+            return Ok(span.map(|target| Location { score: 0, target }));
+        }
+        if !infix && lower != 0 && limit == Some(lower) {
+            // Only the full target can fit, and only by embedding in the query.
+            return Ok(global::distance_at_most(query, target, lower)?
+                .map(|score| Location { score, target: 0..n }));
+        }
+    }
+    // A longer anchored span cannot meet the bound even on length alone.
+    let extent = if infix { n } else { n.min(m.saturating_add(limit.unwrap_or(m))) };
+    check_lengths(m, extent)?;
     let sequence = if suffix { Sequence::reversed(query) } else { Sequence::new(query) };
     let profile = Profile::new(sequence, additional_equalities)?;
     let mut blocks = Vec::new();
-    let mut consumed = 0;
-    let score = search_distance(upper, limit, |k| {
+    let hit = search_distance(m, limit, |k| {
         if k < lower {
             return None;
         }
-        let (score, end) = if suffix {
+        if suffix {
             let window = target.iter().rev().take(m + k).copied();
             kernel::anchored_last(&profile, window, k, &mut blocks)
         } else {
             let end = if infix { n } else { n.min(m + k) };
             kernel::semiglobal_first(&profile, target[..end].iter().copied(), k, infix, &mut blocks)
-        }?;
-        consumed = end;
-        Some(score)
+        }
     });
-    let Some(score) = score else { return Ok(None) };
-    let (span, forward) = if suffix {
-        drop(profile);
-        (n - consumed..n, None)
+    let Some((score, consumed)) = hit else { return Ok(None) };
+    if let Some(slot) = save_forward.filter(|_| !suffix && score != 0 && consumed != 0) {
+        *slot = Some(profile);
     } else {
-        let start = if !infix || consumed == 0 {
-            0
+        drop(profile);
+    }
+    let span = if suffix {
+        n - consumed..n
+    } else {
+        let start = if !infix || consumed == 0 || consumed == m - score {
+            0 // At the minimum possible length, only start zero can fit.
         } else if score == 0 {
             consumed - m // An exact hit has only one possible start.
         } else {
@@ -650,11 +779,9 @@ pub fn align_runs(
             debug_assert_eq!(reverse_score, score);
             consumed - len
         };
-        (start..consumed, Some(profile))
+        start..consumed
     };
-    drop(blocks);
-    let runs = crate::path::reconstruct(query, &target[span.clone()], additional_equalities, score, forward)?;
-    Ok(Some(RunAlignment { score, target: span, runs }))
+    Ok(Some(Location { score, target: span }))
 }
 
 /// A positive number of consecutive operations of the same kind.
@@ -675,6 +802,13 @@ pub struct RunAlignment {
     pub target: Range<usize>,
     /// Positive-length, coalesced operations in forward order, including matches.
     pub runs: Vec<Run>,
+}
+
+impl RunAlignment {
+    /// Formats the aligned runs directly, without expanding them into unit operations.
+    pub fn cigar(&self, format: CigarFormat) -> Cigar<'_> {
+        Cigar::from_runs(&self.runs, format)
+    }
 }
 
 /// Owns all result buffers. Accessors borrow without copying; `Send + Sync`.
@@ -718,7 +852,7 @@ impl Alignment {
     }
     /// Borrowed, allocation-free CIGAR formatter, absent if no path was computed.
     pub fn cigar(&self, format: CigarFormat) -> Option<Cigar<'_>> {
-        self.path().map(|path| Cigar { path, format })
+        self.path().map(|path| Cigar { path: CigarPath::Units(path), format })
     }
 }
 
@@ -746,31 +880,56 @@ pub enum CigarFormat {
 /// Formats directly into the caller's formatter, without an intermediate buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct Cigar<'a> {
-    path: &'a [EditOperation],
+    path: CigarPath<'a>,
     format: CigarFormat,
 }
+
+#[derive(Clone, Copy, Debug)]
+enum CigarPath<'a> {
+    Units(&'a [EditOperation]),
+    Runs(&'a [Run]),
+}
+
+impl<'a> Cigar<'a> {
+    /// Borrows a run path for display. Formatting takes time proportional to the
+    /// number of runs, not their total length. An empty path formats as `""`.
+    pub fn from_runs(runs: &'a [Run], format: CigarFormat) -> Self {
+        Self { path: CigarPath::Runs(runs), format }
+    }
+}
+
 impl fmt::Display for Cigar<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut codes = self.path.iter().map(|op| match (op, self.format) {
-            (EditOperation::Insert, _) => 'I',
-            (EditOperation::Delete, _) => 'D',
-            (EditOperation::Match, CigarFormat::Extended) => '=',
-            (EditOperation::Mismatch, CigarFormat::Extended) => 'X',
-            _ => 'M',
-        });
-        let Some(mut previous) = codes.next() else {
-            return Ok(());
-        };
-        let mut count = 1usize;
-        for code in codes {
-            if code == previous {
-                count += 1;
-            } else {
-                write!(f, "{count}{previous}")?;
-                previous = code;
-                count = 1;
+        fn write_runs(
+            f: &mut fmt::Formatter<'_>, format: CigarFormat, runs: impl Iterator<Item = Run>,
+        ) -> fmt::Result {
+            let mut codes = runs.map(|Run { op, len }| {
+                let code = match (op, format) {
+                    (EditOperation::Insert, _) => 'I',
+                    (EditOperation::Delete, _) => 'D',
+                    (EditOperation::Match, CigarFormat::Extended) => '=',
+                    (EditOperation::Mismatch, CigarFormat::Extended) => 'X',
+                    _ => 'M',
+                };
+                (code, len)
+            });
+            let Some((mut previous, len)) = codes.next() else { return Ok(()) };
+            // A caller-provided run slice can merge lengths beyond a single usize.
+            let mut count = len as u128;
+            for (code, len) in codes {
+                if code == previous {
+                    count += len as u128;
+                } else {
+                    write!(f, "{count}{previous}")?;
+                    previous = code;
+                    count = len as u128;
+                }
             }
+            write!(f, "{count}{previous}")
         }
-        write!(f, "{count}{previous}")
+        match self.path {
+            CigarPath::Units(path) => write_runs(f, self.format, path.iter().map(|&op| Run { op, len: 1 })),
+            CigarPath::Runs(runs) => write_runs(f, self.format, runs.iter().copied()),
+        }
     }
 }

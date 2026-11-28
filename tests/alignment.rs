@@ -102,6 +102,89 @@ fn score_only_distances_match_scalar_dp() {
 }
 
 #[test]
+fn anchored_locations_are_pinned_and_cutoffs_are_inclusive() {
+    use rust_edlib::{
+        Location, prefix_locate, prefix_locate_at_most, suffix_locate, suffix_locate_at_most,
+    };
+    for (locate, bounded, target, span) in [
+        (prefix_locate as fn(&[u8], &[u8]) -> _, prefix_locate_at_most as fn(&[u8], &[u8], usize) -> _, b"AXC__", 0..3),
+        (suffix_locate, suffix_locate_at_most, b"__AXC", 2..5),
+    ] {
+        let hit = Location { score: 1, target: span };
+        assert_eq!(locate(b"ABC", target), Ok(hit.clone()));
+        assert_eq!(bounded(b"ABC", target, usize::MAX), Ok(Some(hit.clone())));
+        assert_eq!(bounded(b"ABC", target, 1), Ok(Some(hit)));
+        assert_eq!(bounded(b"ABC", target, 0), Ok(None));
+        assert_eq!(bounded(b"ABC", b"_ABC_", 0), Ok(None));
+        assert_eq!(bounded(b"ABC", b"", 2), Ok(None));
+        assert_eq!(bounded(b"ABC", b"", 3), Ok(Some(Location { score: 3, target: 0..0 })));
+    }
+
+    let query = [0, 255];
+    let left = [0, 255, 128];
+    let right = [128, 0, 255];
+    let prefix = Location { score: 0, target: 0..2 };
+    let suffix = Location { score: 0, target: 1..3 };
+    assert_eq!(prefix_locate_at_most(&query, &left, 0), Ok(Some(prefix.clone())));
+    assert_eq!(suffix_locate_at_most(&query, &right, 0), Ok(Some(suffix.clone())));
+    // The absolute length gap isn't a lower bound when the target is longer.
+    assert_eq!(prefix_locate_at_most(&query, &left, 1), Ok(Some(prefix)));
+    assert_eq!(suffix_locate_at_most(&query, &right, 1), Ok(Some(suffix)));
+    assert_eq!(prefix_locate_at_most(&query, &right, 0), Ok(None));
+    assert_eq!(suffix_locate_at_most(&query, &left, 0), Ok(None));
+    assert_eq!(prefix_locate_at_most(b"", &left, 0), Ok(Some(Location { score: 0, target: 0..0 })));
+    assert_eq!(suffix_locate_at_most(b"", &right, 0), Ok(Some(Location { score: 0, target: 3..3 })));
+}
+
+#[test]
+fn anchored_locations_handle_ties_without_collecting_them() {
+    use rust_edlib::{Location, prefix_locate, suffix_locate};
+
+    let prefix = prefix_locate(b"ABC", b"ABXC").unwrap();
+    assert_eq!(prefix.score, 1);
+    assert_eq!(prefix.target.start, 0);
+    assert!((2..=4).contains(&prefix.target.end)); // AB, ABX and ABXC all cost one.
+    assert_eq!(suffix_locate(b"ABC", b"AXBC"), Ok(Location { score: 1, target: 0..4 }));
+}
+
+#[test]
+fn anchored_exact_query_gap_requires_a_literal_subsequence() {
+    use rust_edlib::{
+        Location, align_runs, prefix_distance_at_most, prefix_locate_at_most, suffix_distance_at_most,
+        suffix_locate_at_most,
+    };
+    let query = b"AXBXC";
+    let gap = 2;
+    let pairs = [EqualityPair::new(b'C', b'D')];
+    let cases = [
+        (AlignmentMode::Prefix, prefix_distance_at_most as fn(&[u8], &[u8], usize) -> _,
+         prefix_locate_at_most as fn(&[u8], &[u8], usize) -> _),
+        (AlignmentMode::Suffix, suffix_distance_at_most, suffix_locate_at_most),
+    ];
+    for (mode, distance, locate) in cases {
+        let target = b"ABC";
+        assert_eq!(distance(query, target, gap - 1), Ok(None));
+        assert_eq!(locate(query, target, gap - 1), Ok(None));
+        assert_eq!(align_runs(query, target, mode, Some(gap - 1), &[]), Ok(None));
+        assert_eq!(distance(query, target, gap), Ok(Some(gap)));
+        assert_eq!(locate(query, target, gap), Ok(Some(Location { score: gap, target: 0..3 })));
+        let hit = align_runs(query, target, mode, Some(gap), &[]).unwrap().unwrap();
+        assert_eq!((hit.score, hit.target.clone()), (gap, 0..3));
+        assert_eq!(hit.cigar(CigarFormat::Extended).to_string(), "1=1I1=1I1=");
+
+        let target = b"ABD";
+        assert_eq!(distance(query, target, gap), Ok(None));
+        assert_eq!(locate(query, target, gap), Ok(None));
+        assert_eq!(align_runs(query, target, mode, Some(gap), &[]), Ok(None));
+        assert_eq!(distance(query, target, gap + 1), Ok(Some(gap + 1)));
+        assert_eq!(locate(query, target, gap + 1).unwrap().unwrap().score, gap + 1);
+        assert_eq!(align_runs(query, target, mode, Some(gap + 1), &[]).unwrap().unwrap().score, gap + 1);
+        let hit = align_runs(query, target, mode, Some(gap), &pairs).unwrap().unwrap();
+        assert_eq!((hit.score, hit.target), (gap, 0..3));
+    }
+}
+
+#[test]
 fn unbounded_infix_recovers_an_early_optimum_after_a_narrow_band_miss() {
     use rust_edlib::{infix_distance, infix_distance_at_most};
 
@@ -118,6 +201,13 @@ fn unbounded_infix_recovers_an_early_optimum_after_a_narrow_band_miss() {
     let disjoint = [b'x'; 300];
     assert_eq!(infix_distance(&query, &disjoint), Ok(query.len()));
     assert_eq!(infix_distance_at_most(&query, &disjoint, query.len() - 1), Ok(None));
+}
+
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn infix_large_query_sizes_profile_by_used_rows() {
+    let query = vec![b'x'; 64 << 20];
+    assert_eq!(rust_edlib::infix_distance(&query, b"x"), Ok(query.len() - 1));
 }
 
 #[test]
@@ -435,6 +525,9 @@ fn cigar_literals_preserve_orientation_and_merge_standard_diagonals() {
             result.cigar(CigarFormat::Standard).unwrap().to_string(),
             standard
         );
+        let runs = rust_edlib::align_runs(query, target, AlignmentMode::Global, None, &[]).unwrap().unwrap();
+        assert_eq!(runs.cigar(CigarFormat::Extended).to_string(), extended);
+        assert_eq!(runs.cigar(CigarFormat::Standard).to_string(), standard);
     }
     let pairs = [EqualityPair::new(255, 128)];
     let result = align(
